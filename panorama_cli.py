@@ -56,6 +56,16 @@ OBJECT_TYPES = [
 ]
 DG_GROUPS = ("DevGroup", "DynGroup")  # static and dynamic device groups
 SHARED_LABEL = "(shared)"  # pseudo group for shared objects
+# Modern REST API (/restapi/<ver>/...); 12.1 was verified to serve v11.0.
+REST_VERSIONS = ("v11.0", "v12.0", "v10.0")
+REST_RESOURCES = {
+    "address": "Objects/Addresses",
+    "address-group": "Objects/AddressGroups",
+    "service": "Objects/Services",
+    "service-group": "Objects/ServiceGroups",
+    "application": "Objects/Applications",
+    "tag": "Objects/Tags",
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -248,6 +258,94 @@ class PanoramaClient:
     def config_delete(self, path: str):
         return self.config_write("delete", path)
 
+    # ---------------- Modern REST API (panui_restapi) ------------------- #
+    def _rest(self, method: str, path: str, params: dict | None = None,
+              body: dict | None = None) -> dict:
+        query = dict(params or {})
+        url = f"https://{self.host}{path}"
+        headers = {"X-PAN-KEY": self.api_key,
+                   "Content-Type": "application/json"}
+        payload = json.dumps(body) if body is not None else None
+        resp = self.session.request(method, url, params=query, data=payload,
+                                    timeout=self.timeout, verify=False,
+                                    headers=headers)
+        if self.debug:
+            print(f"REST {method} {url}", file=sys.stderr)
+            print(f"params: {query}", file=sys.stderr)
+            print(f"HTTP {resp.status_code}\n{resp.text[:2000]}",
+                  file=sys.stderr)
+        try:
+            data = resp.json()
+        except ValueError:
+            raise RuntimeError(
+                f"REST {method} {path} (HTTP {resp.status_code}): "
+                f"{resp.text[:200]}")
+        ok = resp.status_code < 400 and \
+            str(data.get("@status", "success")).lower() == "success"
+        if not ok:
+            msg = data.get("message") or data.get("msg") or resp.text[:200]
+            raise RuntimeError(
+                f"REST {method} {path} (HTTP {resp.status_code} "
+                f"code {data.get('code')}): {msg}")
+        return data
+
+    def rest_base(self) -> str:
+        """Discover the supported /restapi version (cached)."""
+        if getattr(self, "_rest_base", None):
+            return self._rest_base
+        for ver in REST_VERSIONS:
+            try:
+                self._rest("GET", f"/restapi/{ver}/Objects/Addresses",
+                           {"location": "shared", "limit": 1})
+            except RuntimeError as exc:
+                if "Version Not Supported" in str(exc):
+                    continue
+                raise
+            self._rest_base = f"/restapi/{ver}"
+            return self._rest_base
+        raise RuntimeError(
+            f"no supported REST API version among {REST_VERSIONS}")
+
+    @staticmethod
+    def _rest_location(device_group: str) -> dict:
+        if device_group == SHARED_LABEL:
+            return {"location": "shared"}
+        return {"location": "device-group", "device-group": device_group}
+
+    @staticmethod
+    def _rest_body(name: str, device_group: str, obj: dict) -> dict:
+        entry = {"@location": ("shared" if device_group == SHARED_LABEL
+                               else "device-group"),
+                 "@name": name}
+        if device_group != SHARED_LABEL:
+            entry["@device-group"] = device_group
+        for key, value in obj.items():
+            if key == "name":
+                continue
+            if key.endswith("member") or key in ("member",):
+                value = value if isinstance(value, list) else [value]
+            elif isinstance(value, dict) and "member" in value:
+                member = value["member"]
+                value = {**value,
+                         "member": member if isinstance(member, list)
+                         else [member]}
+            entry[key] = value
+        return {"entry": [entry]}
+
+    def rest_write(self, obj_type: str, device_group: str, name: str,
+                   obj: dict, create: bool) -> dict:
+        resource = REST_RESOURCES[obj_type]
+        method = "POST" if create else "PUT"
+        params = {**self._rest_location(device_group), "name": name}
+        return self._rest(method, f"{self.rest_base()}/{resource}",
+                          params, self._rest_body(name, device_group, obj))
+
+    def rest_delete(self, obj_type: str, device_group: str,
+                    name: str) -> dict:
+        resource = REST_RESOURCES[obj_type]
+        params = {**self._rest_location(device_group), "name": name}
+        return self._rest("DELETE", f"{self.rest_base()}/{resource}", params)
+
     def running_config(self) -> dict:
         """Fetch the full committed running config once and cache it.
 
@@ -266,7 +364,8 @@ class PanoramaClient:
 
     def raw_get(self, params: dict, path: str = "") -> str:
         """Unparsed response body for diagnostics."""
-        query = {"key": self.api_key, "api-version": API_VERSION}
+        query = ({} if path.startswith("/restapi")
+                 else {"key": self.api_key, "api-version": API_VERSION})
         query.update(params)
         url = f"https://{self.host}{path or '/api/' + API_VERSION}"
         resp = self.session.get(
@@ -706,24 +805,58 @@ def revert_import(client: PanoramaClient, device_group: str,
         return
     ok, failed = 0, []
     for obj_type, name, existed, before in applied:
-        err = None
-        for p in dg_set_paths(device_group, obj_type, name):
-            try:
-                if existed:
-                    client.config_set(p, obj_to_xml(before))
-                else:
-                    client.config_delete(p)
-                ok += 1
-                err = None
-                break
-            except RuntimeError as exc:
-                err = str(exc)
-        if err:
+        if existed:
+            good, err = write_object(client, device_group, obj_type, name,
+                                     before, existed=True)
+        else:
+            good, err = delete_object(client, device_group, obj_type, name)
+        if good:
+            ok += 1
+        else:
             failed.append((f"{obj_type}/{name}", err))
     client._running_config = None
     print(f"Reverted {ok}/{len(applied)} change(s).")
     for name, err in failed[:5]:
         print(f"  FAILED {name}: {err}", file=sys.stderr)
+
+
+def write_object(client: PanoramaClient, device_group: str, obj_type: str,
+                 name: str, obj: dict, existed: bool) -> tuple[bool, str]:
+    """Create/update one object: XML API first, modern REST API on refusal."""
+    last = ""
+    element = obj_to_xml({**obj, "name": name})
+    for set_path in dg_set_paths(device_group, obj_type, name):
+        try:
+            client.config_set(set_path, element)
+            return True, ""
+        except RuntimeError as exc:
+            last = str(exc)
+    if obj_type in REST_RESOURCES:
+        try:
+            client.rest_write(obj_type, device_group, name, obj,
+                              create=not existed)
+            return True, ""
+        except RuntimeError as exc:
+            last = f"XML API: {last}; REST API: {exc}"
+    return False, last
+
+
+def delete_object(client: PanoramaClient, device_group: str, obj_type: str,
+                  name: str) -> tuple[bool, str]:
+    last = ""
+    for set_path in dg_set_paths(device_group, obj_type, name):
+        try:
+            client.config_delete(set_path)
+            return True, ""
+        except RuntimeError as exc:
+            last = str(exc)
+    if obj_type in REST_RESOURCES:
+        try:
+            client.rest_delete(obj_type, device_group, name)
+            return True, ""
+        except RuntimeError as exc:
+            last = f"XML API: {last}; REST API: {exc}"
+    return False, last
 
 
 def import_objects(client: PanoramaClient, device_group: str) -> None:
@@ -781,21 +914,15 @@ def import_objects(client: PanoramaClient, device_group: str) -> None:
             before = existing[obj_type].get(name)
             payload = {k: fmt_value(v) for k, v in entry.items()
                        if k != "name"}
-            element = obj_to_xml(entry)
-            err = None
-            for set_path in dg_set_paths(device_group, obj_type, name):
-                try:
-                    client.config_set(set_path, element)
-                    ok += 1
-                    err = None
-                    break
-                except RuntimeError as exc:
-                    err = str(exc)
-            if err:
+            applied_entry, err = write_object(
+                client, device_group, obj_type, name, entry,
+                existed=before is not None)
+            if not applied_entry:
                 failed.append((f"{obj_type}/{name}", err))
                 changes.append((obj_type, name, "FAILED",
-                                [], err.split(":")[-1].strip()))
+                                [], err.split(";")[-1].strip()))
                 continue
+            ok += 1
             # PAN-OS set merges: fields not in the payload stay as they were.
             eff = {**_fields_of(before), **payload}
             lines = diff_entry_lines(before, eff)
@@ -823,20 +950,9 @@ def import_objects(client: PanoramaClient, device_group: str) -> None:
 
     if not applied:
         if ok == 0 and failed:
-            print("Nothing was applied; check --debug output above.",
-                  file=sys.stderr)
-            if any("code 16" in err for _, err in failed):
-                print("\nPanorama refused the API write (code 16 = "
-                      "unauthorized).\n"
-                      "Possible causes:\n"
-                      "  - the admin role has 'API command authorization' "
-                      "restrictions (Server Management > Administrative "
-                      "Roles), or\n"
-                      "  - this Panorama only allows config writes via the "
-                      "REST v13 API.\n"
-                      "Run with --diagnose and check the v13 probe output "
-                      "so we can switch writes to that API.",
-                      file=sys.stderr)
+            print("Nothing was applied; both the XML API and the modern REST "
+                  "API refused the writes. Full errors above "
+                  "(run with --debug for each request).", file=sys.stderr)
         return
 
     actions = ["commit changes", "revert this import", "leave pending"]

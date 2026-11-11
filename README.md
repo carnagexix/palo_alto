@@ -76,6 +76,11 @@ Flow:
    - **[3] leave pending** - changes stay in the candidate config; commit from
      the Panorama UI/CLI later.
 
+Note: some Panorama deployments reject XML API config writes with `code 16
+unauthorized`. The script automatically falls back to the modern REST API
+(`/restapi/v11.0|v12.0/Objects/...`, `X-PAN-KEY` auth) for create/update/
+delete in that case; both are tried and combined errors are shown if both fail.
+
 One file may mix object types if it declares them:
 
 - **CSV**: include a `type` column (`address`, `address-group`, `service`,
