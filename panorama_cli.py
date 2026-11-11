@@ -207,15 +207,22 @@ class PanoramaClient:
     def _request(self, params: dict):
         query = {"key": self.api_key, "api-version": API_VERSION}
         query.update(params)
+        if "path" in query:
+            # PAN-OS config APIs historically read 'xpath'; send both names.
+            query["xpath"] = query["path"]
         url = f"https://{self.host}/api/{API_VERSION}"
         resp = self.session.get(url, params=query, timeout=self.timeout,
                                 verify=False)
         return self._handle_response(resp, url, query)
 
     def config_write(self, action: str, path: str, element: str | None = None):
-        """POST type=config action=set|delete (payload via form body for size)."""
+        """POST type=config action=set|delete (payload via form body for size).
+
+        Config writes read the path from 'xpath' (not 'path'); send both.
+        """
         data = {"key": self.api_key, "api-version": API_VERSION,
-                "type": "config", "action": action, "path": path}
+                "type": "config", "action": action, "path": path,
+                "xpath": path}
         if element is not None:
             data["element"] = element
         url = f"https://{self.host}/api/{API_VERSION}"
