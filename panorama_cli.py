@@ -971,20 +971,27 @@ def delete_object(client: PanoramaClient, device_group: str, obj_type: str,
 
 
 def import_objects(client: PanoramaClient, device_group: str) -> None:
-    path = input("File to import (.json or .csv): ").strip().strip('"')
-    try:
-        groups = read_import_file(path)
-    except json.JSONDecodeError as exc:
-        print(f"invalid JSON in {path}: {exc}\n"
-              f"(check for missing brackets/commas; keys and strings need "
-              f"double quotes)", file=sys.stderr)
-        return
-    except OSError as exc:
-        print(f"could not read {path}: {exc}", file=sys.stderr)
-        return
-    if not groups:
-        print("No named entries found in file.")
-        return
+    while True:
+        path = input("File to import (.json or .csv, 'q' to quit): ") \
+            .strip().strip('"')
+        if path.lower() in ("q", "quit"):
+            raise SystemExit("bye")
+        if not path:
+            continue
+        try:
+            groups = read_import_file(path)
+        except json.JSONDecodeError as exc:
+            print(f"invalid JSON in {path}: {exc}\n"
+                  f"(check for missing brackets/commas; keys and strings need "
+                  f"double quotes)", file=sys.stderr)
+            continue
+        except OSError as exc:
+            print(f"could not read {path}: {exc}", file=sys.stderr)
+            continue
+        if not groups:
+            print(f"No named entries found in {path}.")
+            continue
+        break
 
     # Files without type info: ask which object type the entries are.
     for key in list(groups):
