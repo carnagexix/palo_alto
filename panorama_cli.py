@@ -340,7 +340,9 @@ class PanoramaClient:
         try:
             data = self._rest("GET", f"{self.rest_base()}/{resource}", params)
         except RuntimeError as exc:
-            if any(w in str(exc).lower() for w in ("not found", "does not")):
+            if any(w in str(exc).lower() for w in
+                   ("not present", "not found", "not exist", "does not",
+                    "no object", "http 404")):
                 return None
             raise
         result = data.get("result") if isinstance(data.get("result"), dict) \
@@ -932,12 +934,16 @@ def write_object(client: PanoramaClient, device_group: str, obj_type: str,
         except RuntimeError as exc:
             last = str(exc)
     if obj_type in REST_RESOURCES:
+        # The XML snapshot cannot see candidate-config objects on some
+        # builds; ask the REST API what actually exists before deciding
+        # create vs update.
+        create = not existed
         try:
-            # The XML snapshot cannot see candidate-config objects on some
-            # builds; ask the REST API what actually exists before deciding
-            # create vs update.
             create = client.rest_get_entry(obj_type, device_group,
                                            name) is None
+        except RuntimeError:
+            pass
+        try:
             client.rest_write(obj_type, device_group, name, obj,
                               create=create)
             return True, ""
