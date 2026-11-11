@@ -1,0 +1,102 @@
+{
+  "address": [
+    {
+      "name": "corp-dns",
+      "description": "Corporate DNS server",
+      "ip-netmask": "10.10.10.10/32",
+      "tag": {
+        "member": [
+          "office"
+        ]
+      }
+    },
+    {
+      "name": "branch-web",
+      "description": "Branch web servers",
+      "ip-range": "10.20.30.5-10.20.30.20"
+    },
+    {
+      "name": "lab-wildcard",
+      "description": "Lab wildcard",
+      "ip-wildcard": "10.30.0.0/16"
+    },
+    {
+      "name": "espana-srv",
+      "description": "Spain server by country",
+      "ip-netmask": "10.40.0.0/24",
+      "country": "ES"
+    }
+  ],
+  "address-group": [
+    {
+      "name": "all-servers",
+      "description": "Group of all servers",
+      "static": {
+        "member": [
+          "corp-dns",
+          "branch-web"
+        ]
+      }
+    }
+  ],
+  "service": [
+    {
+      "name": "ssh-2222",
+      "description": "SSH on alternate port",
+      "protocol": "TCP",
+      "port": "2222",
+      "source-port": "any"
+    },
+    {
+      "name": "https",
+      "description": "HTTPS traffic",
+      "protocol": "TCP",
+      "port": "443",
+      "source-port": "any",
+      "tag": {
+        "member": [
+          "prod"
+        ]
+      }
+    }
+  ],
+  "service-group": [
+    {
+      "name": "web-svcs",
+      "description": "Web services group",
+      "protocol": {
+        "member": [
+          "tcp",
+          "udp"
+        ]
+      },
+      "port": "443"
+    }
+  ],
+  "tag": [
+    {
+      "name": "office",
+      "color": "blue",
+      "comments": "Office sites"
+    },
+    {
+      "name": "prod",
+      "color": "green",
+      "comments": "Production systems"
+    }
+  ],
+  "application": [
+    {
+      "name": "custom-erp",
+      "description": "Custom ERP app",
+      "protocol": {
+        "member": [
+          "tcp"
+        ]
+      },
+      "port": "8001",
+      "category": "Enterprise-Business-Process",
+      "subcategory": "ERP"
+    }
+  ]
+}

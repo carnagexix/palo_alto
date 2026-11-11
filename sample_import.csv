@@ -1,0 +1,12 @@
+type,name,description,ip-netmask,ip-range,ip-wildcard,country,static,protocol,port,source-port,tag,color,comments,category,subcategory
+address,corp-dns,Corporate DNS server,10.10.10.10/32,,,,,,,,"{""member"": [""office""]}",,,,
+address,branch-web,Branch web servers,,10.20.30.5-10.20.30.20,,,,,,,,,,,
+address,lab-wildcard,Lab wildcard,,,10.30.0.0/16,,,,,,,,,,
+address,espana-srv,Spain server by country,10.40.0.0/24,,,ES,,,,,,,,,
+address-group,all-servers,Group of all servers,,,,,"{""member"": [""corp-dns"", ""branch-web""]}",,,,,,,,
+service,ssh-2222,SSH on alternate port,,,,,,TCP,2222,any,,,,,
+service,https,HTTPS traffic,,,,,,TCP,443,any,"{""member"": [""prod""]}",,,,
+service-group,web-svcs,Web services group,,,,,,"{""member"": [""tcp"", ""udp""]}",443,,,,,,
+tag,office,,,,,,,,,,,blue,Office sites,,
+tag,prod,,,,,,,,,,,green,Production systems,,
+application,custom-erp,Custom ERP app,,,,,,"{""member"": [""tcp""]}",8001,,,,,Enterprise-Business-Process,ERP

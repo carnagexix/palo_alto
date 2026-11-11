@@ -1,0 +1,23 @@
+# secrets - never commit
+.panorama_api_key
+*.env
+
+# debug dumps / generated artifacts
+import.txt
+diff_*.txt
+__pycache__/
+*.pyc
+
+# exported objects
+*_address.json
+*_address.csv
+*_address-group.json
+*_address-group.csv
+*_service.json
+*_service.csv
+*_service-group.json
+*_service-group.csv
+*_application.json
+*_application.csv
+*_tag.json
+*_tag.csv
