@@ -216,9 +216,11 @@ class PanoramaClient:
         return self._handle_response(resp, url, query)
 
     def config_write(self, action: str, path: str, element: str | None = None):
-        """POST type=config action=set|delete (payload via form body for size).
+        """Send type=config action=set|delete.
 
         Config writes read the path from 'xpath' (not 'path'); send both.
+        Try POST form body first (payload can be large), fall back to GET
+        query form if the platform answers 'code 16 unauthorized'.
         """
         data = {"key": self.api_key, "api-version": API_VERSION,
                 "type": "config", "action": action, "path": path,
@@ -228,7 +230,17 @@ class PanoramaClient:
         url = f"https://{self.host}/api/{API_VERSION}"
         resp = self.session.post(url, data=data, timeout=self.timeout,
                                  verify=False)
-        return self._handle_response(resp, url, data)
+        try:
+            return self._handle_response(resp, url, data)
+        except RuntimeError as exc:
+            if "code 16" not in str(exc):
+                raise
+            if element is not None and len(element) > 4000:
+                raise
+            return self._handle_response(
+                self.session.get(url, params=data, timeout=self.timeout,
+                                 verify=False),
+                url, data)
 
     def config_set(self, path: str, element: str):
         return self.config_write("set", path, element)
@@ -810,7 +822,20 @@ def import_objects(client: PanoramaClient, device_group: str) -> None:
 
     if not applied:
         if ok == 0 and failed:
-            print("Nothing was applied; check --debug output above.")
+            print("Nothing was applied; check --debug output above.",
+                  file=sys.stderr)
+            if any("code 16" in err for _, err in failed):
+                print("\nPanorama refused the API write (code 16 = "
+                      "unauthorized).\n"
+                      "Possible causes:\n"
+                      "  - the admin role has 'API command authorization' "
+                      "restrictions (Server Management > Administrative "
+                      "Roles), or\n"
+                      "  - this Panorama only allows config writes via the "
+                      "REST v13 API.\n"
+                      "Run with --diagnose and check the v13 probe output "
+                      "so we can switch writes to that API.",
+                      file=sys.stderr)
         return
 
     actions = ["commit changes", "revert this import", "leave pending"]
@@ -904,6 +929,20 @@ def run_diagnostics(client: PanoramaClient) -> None:
         ("new REST API v13 device-group",
          {"panorama": "LocalDevice", "type": "device-group"},
          "/api/rest/v13/device-group"),
+        ("v13 device-group (no type param)",
+         {"panorama": "LocalDevice"}, "/api/rest/v13/device-group"),
+        ("v13 address (panorama+device-group)",
+         {"panorama": "LocalDevice", "device-group": "Physical",
+          "limit": "5"}, "/api/rest/v13/address"),
+        ("v13 address (panorama only)",
+         {"panorama": "LocalDevice", "limit": "5"},
+         "/api/rest/v13/address"),
+        ("REST API docs index",
+         {}, "/restapi-doc/"),
+        ("REST API v13 openapi spec (first 3000 chars)",
+         {}, "/restapi-doc/v13/openapi.json"),
+        ("REST API docs v13 index",
+         {}, "/restapi-doc/v13/index.html"),
     ]
     for label, params, path in probes:
         print(f"\n===== {label} =====", file=sys.stderr)
