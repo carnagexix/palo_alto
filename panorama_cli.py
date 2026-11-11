@@ -1000,7 +1000,9 @@ def import_objects(client: PanoramaClient, device_group: str) -> None:
             print("Nothing was applied; both the XML API and the modern REST "
                   "API refused the writes. Full errors above "
                   "(run with --debug for each request).", file=sys.stderr)
-        return
+            return
+        print("Nothing new to apply (objects already match), but there may "
+              "still be pending candidate changes to commit below.")
 
     actions = ["commit changes", "revert this import", "leave pending"]
     action = choose(actions, "Post-import")
