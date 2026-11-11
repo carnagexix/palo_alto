@@ -26,7 +26,7 @@ Interactive flow:
 ```
 Device groups   -> pick one (number), or "(shared)" for shared objects
 Action          -> [1] list objects   [2] export CSV/JSON   [3] import CSV/JSON
-                   [4] move object(s) to shared   (only for device groups)
+                   [4] copy/move object(s) to shared   (only for device groups)
 Object types    -> pick one (address, service, ...)
 ```
 
@@ -87,25 +87,34 @@ objects in place.
 The post-import commit is tried the same way (classic XML `type=commit`
 command first, REST `Commit` endpoint as fallback).
 
-## Move objects to shared
+## Copy/move objects to shared
 
-Choose **move object(s) to shared** in the Action menu (only offered when a
-real device group is selected). Pick object type, then select entries by
-number (`a` = all). Each selected object is recreated in **(shared)** with the
-same name and all properties, then deleted from the device group. Names that
+Choose **copy/move object(s) to shared** in the Action menu (only offered when
+a real device group is selected), then pick a mode:
+
+- **copy** - creates the shared object and **keeps** the device-group object.
+  Use this when rules/local firewalls still reference the local object. The
+  device-group object shadows the shared one inside that device group (this
+  is valid PAN-OS scoping).
+- **move** - creates the shared object, then deletes the device-group object.
+
+Pick object type, then select entries by number (`a` = all). Each object is
+recreated in **(shared)** with the same name and all properties. Names that
 already exist as shared objects are **skipped, never overwritten**.
 
 Flow mirrors import:
 
-1. A **preview diff** (`<dg>_diff_move-preview_<timestamp>.txt`) shows
-   `MOVE`/`SKIP` per object and the location change, before anything is sent.
-2. After applying, a **verification diff** (`<dg>_diff_move_<timestamp>.txt`)
+1. A **preview diff** (`<dg>_diff_<mode>-preview_<timestamp>.txt`) shows
+   `COPY`/`MOVE`/`SKIP` per object and the location change, before anything
+   is sent.
+2. After applying, a **verification diff** (`<dg>_diff_<mode>_<timestamp>.txt`)
    reads each shared object back and compares every property against the
    original device-group entry (`all properties identical` / any `-`/`+`
    lines).
-3. Post-move menu: **[1] commit changes**, **[2] revert this move** (restores
-   objects in the device group and deletes the shared copies this move
-   created; writes its own `move-revert` diff), **[3] leave pending**.
+3. Post-op menu: **[1] commit changes**, **[2] revert this copy/move** (for
+   move: restores objects in the device group and deletes the shared copies;
+   for copy: deletes only the shared copies - the source objects were never
+   touched; writes its own revert diff), **[3] leave pending**.
 
 Note: source objects are read from the committed (running) config, so
 uncommitted changes made in the Panorama UI are not included in a move.
