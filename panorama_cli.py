@@ -1198,6 +1198,96 @@ def _shared_exists(client: PanoramaClient, obj_type: str,
     return any(e.get("name") == name for e in entries)
 
 
+def _move_diff_write(device_group: str, obj_type: str, phase: str,
+                     changes: list[tuple]) -> tuple[str, str]:
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = safe_filename(device_group, f"diff_{phase}_{ts}", "txt")
+    header = (f"Panorama move diff\n"
+              f"Move        : {device_group} -> {SHARED_LABEL}\n"
+              f"Object type : {obj_type}\n"
+              f"Phase       : {phase}\n"
+              f"Generated   : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+              f"(before = state in '{device_group}'; after = state in "
+              f"'{SHARED_LABEL}')\n" + "=" * 60 + "\n\n")
+    body: list[str] = []
+    for ct, name, status, lines, err in changes:
+        body.append(f"[{status}] {ct}/{name}")
+        if err:
+            body.append(f"  ! {err}")
+        body.extend(lines or [])
+        body.append("")
+    text = header + "\n".join(body)
+    Path(path).write_text(text, encoding="utf-8")
+    return path, text
+
+
+def _move_print_diff(text: str, diff_path: str) -> None:
+    lines = text.splitlines()
+    print(f"\n--- diff (full copy: {diff_path}) ---")
+    for line in lines[:60]:
+        print(line)
+    if len(lines) > 60:
+        print(f"[... {len(lines) - 60} more lines in {diff_path}]")
+    print("--- end diff ---\n")
+
+
+def _readback(client: PanoramaClient, obj_type: str, location: str,
+              name: str) -> dict | None:
+    try:
+        return client.rest_get_entry(obj_type, location, name)
+    except RuntimeError:
+        return None
+
+
+def revert_move(client: PanoramaClient, device_group: str, obj_type: str,
+                applied: list[tuple]) -> None:
+    """Undo a move: restore objects in the device group, delete the shared
+    copies the move created."""
+    if not applied:
+        print("Nothing to revert.")
+        return
+    print(f"Reverting {len(applied)} move(s): objects restored to "
+          f"'{device_group}', shared copies created by the move deleted:")
+    for name, _fields, _partial in applied[:10]:
+        print(f"  - {name}")
+    if input("Type 'yes' to revert: ").strip().lower() != "yes":
+        print("Revert skipped.")
+        return
+    changes = []
+    for name, fields, _partial in applied:
+        ok1, err1 = write_object(client, device_group, obj_type, name, fields,
+                                 existed=True)
+        ok2, err2 = delete_object(client, SHARED_LABEL, obj_type, name)
+        if ok1 and ok2:
+            status, err = "RESTORED", ""
+        elif ok2:
+            status, err = "FAILED", (f"shared copy deleted but restore into "
+                                     f"'{device_group}' failed: {err1}")
+        else:
+            status, err = "PARTIAL", (f"restored into '{device_group}' but "
+                                      f"shared copy still present: {err2}")
+        lines = [f"  ~ location: '{SHARED_LABEL}' -> '{device_group}'"]
+        after = _readback(client, obj_type, device_group, name)
+        if after is None:
+            lines.append("  ! device-group copy could not be read back for "
+                         "verification")
+        elif not diff_entry_lines({"name": name, **fields}, after):
+            lines.append("  (all properties identical)")
+        else:
+            lines.extend(diff_entry_lines({"name": name, **fields}, after))
+        changes.append((obj_type, name, status, lines, err))
+    client._running_config = None
+    restored = sum(1 for c in changes if c[2] == "RESTORED")
+    print(f"Reverted {restored}/{len(applied)} object(s).")
+    diff_path, text = _move_diff_write(device_group, obj_type,
+                                       "move-revert", changes)
+    _move_print_diff(text, diff_path)
+    actions = ["commit changes", "leave pending"]
+    action = choose(actions, "Post-revert")
+    if action == actions[0]:
+        commit_changes(client)
+
+
 def move_to_shared(client: PanoramaClient, device_group: str,
                    obj_type: str) -> None:
     """Copy objects from a device group into (shared) keeping all properties,
@@ -1240,10 +1330,23 @@ def move_to_shared(client: PanoramaClient, device_group: str,
     if not moves:
         print("Nothing to move: all selected names already exist in shared.")
         return
+
+    preview = []
+    for entry in moves:
+        fields = {k: v for k, v in entry.items() if k != "name"}
+        preview.append((obj_type, entry["name"], "MOVE",
+                        _move_diff_lines(device_group, fields, fields), ""))
+    for name in skips:
+        preview.append((obj_type, name, "SKIP", [],
+                        "already exists in shared (not overwritten)"))
+    diff_path, text = _move_diff_write(device_group, obj_type,
+                                       "move-preview", preview)
+    _move_print_diff(text, diff_path)
+
     if input("Type 'yes' to move these objects: ").strip().lower() != "yes":
         print("Move cancelled.")
         return
-    moved, partial, failed = [], [], []
+    applied = []
     for entry in moves:
         name = entry["name"]
         if _shared_exists(client, obj_type, name):
@@ -1253,30 +1356,59 @@ def move_to_shared(client: PanoramaClient, device_group: str,
         ok, err = write_object(client, SHARED_LABEL, obj_type, name, fields,
                                existed=False)
         if not ok:
-            failed.append((name, err))
+            applied.append((name, fields, None, "FAILED", err))
             continue
         ok2, err2 = delete_object(client, device_group, obj_type, name)
-        if ok2:
-            moved.append(name)
-        else:
-            partial.append((name, err2))
+        applied.append((name, fields, True if ok2 else False,
+                        "MOVED" if ok2 else "PARTIAL",
+                        "" if ok2 else
+                        f"created in shared but still present in "
+                        f"'{device_group}': {err2}"))
     client._running_config = None
-    note = f"Moved {len(moved)} object(s) into '{SHARED_LABEL}'"
+
+    changes = []
+    for name, fields, _ok, status, err in applied:
+        after = _readback(client, obj_type, SHARED_LABEL, name) \
+            if status != "FAILED" else None
+        changes.append((obj_type, name, status,
+                        _move_diff_lines(device_group, fields, after), err))
+    for name in skips:
+        changes.append((obj_type, name, "SKIPPED", [],
+                        "already exists in shared (not overwritten)"))
+    diff_path, text = _move_diff_write(device_group, obj_type, "move",
+                                       changes)
+
+    moved = sum(1 for c in changes if c[2] == "MOVED")
+    note = f"Moved {moved} object(s) into '{SHARED_LABEL}'"
     if skips:
         note += f", skipped {len(skips)} shared duplicate(s)"
     print(f"\n{note}.")
-    for name, err in partial:
-        print(f"  WARNING {name}: created in shared but still present in "
-              f"'{device_group}': {err}", file=sys.stderr)
-    for name, err in failed[:5]:
-        print(f"  FAILED {name}: {err}", file=sys.stderr)
-    if len(failed) > 5:
-        print(f"  ... and {len(failed) - 5} more failures", file=sys.stderr)
-    if moved or partial:
-        actions = ["commit changes", "leave pending"]
-        action = choose(actions, "Post-move")
-        if action == actions[0]:
-            commit_changes(client)
+    _move_print_diff(text, diff_path)
+
+    undoable = [(n, f) for n, f, _ok, s, _e in applied if s != "FAILED"]
+    actions = ["commit changes", "revert this move", "leave pending"]
+    action = choose(actions, "Post-move")
+    if action == actions[0]:
+        commit_changes(client)
+    elif action == actions[1]:
+        revert_move(client, device_group, obj_type,
+                    [(n, f, True) for n, f in undoable])
+
+
+def _move_diff_lines(device_group: str, before_fields: dict | None,
+                     after_fields: dict | None) -> list[str]:
+    lines = [f"  ~ location: '{device_group}' -> '{SHARED_LABEL}'"]
+    if after_fields is None:
+        lines.append("  ! shared copy could not be read back for "
+                     "verification")
+        return lines
+    fd = diff_entry_lines({"name": "-", **(before_fields or {})},
+                          {"name": "-", **after_fields})
+    if not fd:
+        lines.append("  (all properties identical)")
+    else:
+        lines.extend(fd)
+    return lines
 
 
 def main() -> None:

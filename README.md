@@ -93,8 +93,19 @@ Choose **move object(s) to shared** in the Action menu (only offered when a
 real device group is selected). Pick object type, then select entries by
 number (`a` = all). Each selected object is recreated in **(shared)** with the
 same name and all properties, then deleted from the device group. Names that
-already exist as shared objects are **skipped, never overwritten**. Objects
-are committed from the post-move menu, like imports.
+already exist as shared objects are **skipped, never overwritten**.
+
+Flow mirrors import:
+
+1. A **preview diff** (`<dg>_diff_move-preview_<timestamp>.txt`) shows
+   `MOVE`/`SKIP` per object and the location change, before anything is sent.
+2. After applying, a **verification diff** (`<dg>_diff_move_<timestamp>.txt`)
+   reads each shared object back and compares every property against the
+   original device-group entry (`all properties identical` / any `-`/`+`
+   lines).
+3. Post-move menu: **[1] commit changes**, **[2] revert this move** (restores
+   objects in the device group and deletes the shared copies this move
+   created; writes its own `move-revert` diff), **[3] leave pending**.
 
 Note: source objects are read from the committed (running) config, so
 uncommitted changes made in the Panorama UI are not included in a move.
