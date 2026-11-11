@@ -346,6 +346,26 @@ class PanoramaClient:
         params = {**self._rest_location(device_group), "name": name}
         return self._rest("DELETE", f"{self.rest_base()}/{resource}", params)
 
+    def rest_commit(self, description: str) -> dict:
+        base = self.rest_base()
+        body = {"type": "commit"}
+        if description:
+            body["description"] = description
+        try:
+            return self._rest("POST", f"{base}/Commit", body=body)
+        except RuntimeError as exc:
+            first = exc
+        text = str(first).lower()
+        if any(w in text for w in ("panorama", "missing", "required",
+                                   "parameter")):
+            try:
+                return self._rest("POST", f"{base}/Commit",
+                                  body={**body, "panorama": "LocalDevice"})
+            except RuntimeError as exc:
+                raise RuntimeError(f"{first}; retry with panorama param: "
+                                   f"{exc}")
+        raise first
+
     def running_config(self) -> dict:
         """Fetch the full committed running config once and cache it.
 
@@ -768,6 +788,20 @@ def write_diff_file(device_group: str, source: str, changes: list[tuple]) -> str
     return path
 
 
+def _job_summary(data) -> str:
+    job = None
+    if isinstance(data, dict):
+        job = data.get("job")
+        if not isinstance(job, dict) and isinstance(data.get("result"), dict):
+            job = data["result"].get("job")
+    if isinstance(job, dict):
+        bits = [f"{k.lstrip('@')}={v}" for k, v in job.items()
+                if isinstance(v, str)]
+        return "Commit job: " + ", ".join(bits) if bits else \
+            f"Commit job: {json.dumps(job)[:200]}"
+    return f"Commit result: {json.dumps(data, default=str)[:200]}"
+
+
 def commit_changes(client: PanoramaClient) -> None:
     description = input("Commit description (blank for none): ").strip()
     print("WARNING: this commits ALL pending Panorama changes (not just this "
@@ -775,20 +809,33 @@ def commit_changes(client: PanoramaClient) -> None:
     if input("Type 'yes' to commit: ").strip().lower() != "yes":
         print("Commit skipped; changes stay in the candidate config.")
         return
+    errors = []
+    try:
+        data = client.rest_commit(description)
+        client._running_config = None
+        print(_job_summary(data))
+        print("Monitor progress in Panorama: show jobs id <id> (UI or CLI).")
+        return
+    except RuntimeError as exc:
+        errors.append(f"REST API: {exc}")
     desc_xml = f"<description>{escape(description)}</description>" \
         if description else ""
     try:
         result = client._request(
-            {"type": "op", "cmd": f"<commit>{desc_xml}</commit>"})
+            {"type": "commit", "cmd": f"<commit>{desc_xml}</commit>"})
         client._running_config = None
-        job = None
-        if isinstance(result, dict):
-            job = result.get("job") or result
-        print(f"Commit job started: {job}")
-        print('Monitor progress in Panorama: show jobs id <id> '
-              "(UI or CLI).")
+        if isinstance(result, dict) and result:
+            print(f"Commit job started: {result}")
+        else:
+            print("Commit command accepted (job queued on Panorama).")
+        print("Monitor progress in Panorama: show jobs id <id> (UI or CLI).")
     except RuntimeError as exc:
-        print(f"commit failed: {exc}", file=sys.stderr)
+        errors.append(f"XML API: {exc}")
+    if errors:
+        for err in errors:
+            print(f"commit failed - {err}", file=sys.stderr)
+        print("You can still commit from the Panorama UI (Commit button) or "
+              "CLI ('commit').", file=sys.stderr)
 
 
 def revert_import(client: PanoramaClient, device_group: str,
