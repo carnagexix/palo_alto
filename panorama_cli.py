@@ -332,13 +332,57 @@ class PanoramaClient:
             entry[key] = value
         return {"entry": [entry]}
 
+    def rest_get_entry(self, obj_type: str, device_group: str,
+                       name: str) -> dict | None:
+        """Return the REST view of one object (None if absent/not readable)."""
+        resource = REST_RESOURCES[obj_type]
+        params = {**self._rest_location(device_group), "name": name}
+        try:
+            data = self._rest("GET", f"{self.rest_base()}/{resource}", params)
+        except RuntimeError as exc:
+            if any(w in str(exc).lower() for w in ("not found", "does not")):
+                return None
+            raise
+        result = data.get("result") if isinstance(data.get("result"), dict) \
+            else data
+        entries = result.get("entry") if isinstance(result, dict) else None
+        if isinstance(entries, dict):
+            entries = [entries]
+        for entry in entries or []:
+            if isinstance(entry, dict) and entry.get("@name") == name:
+                return {k: v for k, v in entry.items() if not k.startswith("@")}
+        return None
+
     def rest_write(self, obj_type: str, device_group: str, name: str,
                    obj: dict, create: bool) -> dict:
         resource = REST_RESOURCES[obj_type]
-        method = "POST" if create else "PUT"
         params = {**self._rest_location(device_group), "name": name}
-        return self._rest(method, f"{self.rest_base()}/{resource}",
-                          params, self._rest_body(name, device_group, obj))
+        body = self._rest_body(name, device_group, obj)
+        base = self.rest_base()
+
+        def call(method: str) -> dict:
+            return self._rest(method, f"{base}/{resource}", params, body)
+
+        first = "POST" if create else "PUT"
+        other = "PUT" if create else "POST"
+        try:
+            return call(first)
+        except RuntimeError as exc:
+            if not any(w in str(exc).lower() for w in
+                       ("unique", "exist", "already", "not found")):
+                raise
+            errors = [f"{first}: {exc}"]
+        try:
+            return call(other)
+        except RuntimeError as exc:
+            errors.append(f"{other}: {exc}")
+        # last resort: replace (delete then create)
+        try:
+            self.rest_delete(obj_type, device_group, name)
+            return call("POST")
+        except RuntimeError as exc:
+            errors.append(f"replace: {exc}")
+        raise RuntimeError("; ".join(errors))
 
     def rest_delete(self, obj_type: str, device_group: str,
                     name: str) -> dict:
@@ -889,8 +933,13 @@ def write_object(client: PanoramaClient, device_group: str, obj_type: str,
             last = str(exc)
     if obj_type in REST_RESOURCES:
         try:
+            # The XML snapshot cannot see candidate-config objects on some
+            # builds; ask the REST API what actually exists before deciding
+            # create vs update.
+            create = client.rest_get_entry(obj_type, device_group,
+                                           name) is None
             client.rest_write(obj_type, device_group, name, obj,
-                              create=not existed)
+                              create=create)
             return True, ""
         except RuntimeError as exc:
             last = f"XML API: {last}; REST API: {exc}"

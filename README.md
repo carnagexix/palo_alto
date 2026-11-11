@@ -80,6 +80,9 @@ Note: some Panorama deployments reject XML API config writes with `code 16
 unauthorized`. The script automatically falls back to the modern REST API
 (`/restapi/v11.0|v12.0/Objects/...`, `X-PAN-KEY` auth) for create/update/
 delete in that case; both are tried and combined errors are shown if both fail.
+Existing objects are detected via the REST API and overwritten automatically
+(POST -> PUT -> delete+create cascade), so re-importing an updated file updates
+objects in place.
 The post-import commit is tried the same way (classic XML `type=commit`
 command first, REST `Commit` endpoint as fallback).
 
