@@ -1186,6 +1186,99 @@ def run_diagnostics(client: PanoramaClient) -> None:
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
+def _shared_exists(client: PanoramaClient, obj_type: str,
+                   name: str) -> bool:
+    try:
+        if client.rest_get_entry(obj_type, SHARED_LABEL, name) is not None:
+            return True
+    except RuntimeError:
+        pass
+    shared = find_device_group(client, SHARED_LABEL)
+    entries = as_entry_list(dig(shared, obj_type)) if shared else []
+    return any(e.get("name") == name for e in entries)
+
+
+def move_to_shared(client: PanoramaClient, device_group: str,
+                   obj_type: str) -> None:
+    """Copy objects from a device group into (shared) keeping all properties,
+    then remove them from the device group. Names that already exist as
+    shared objects are skipped, never overwritten."""
+    if device_group == SHARED_LABEL:
+        print("Nothing to move: these objects are already shared.")
+        return
+    entries = get_device_group_objects(client, device_group, obj_type)
+    if not entries:
+        print(f"No '{obj_type}' objects found in '{device_group}'.")
+        return
+    print(f"\n'{obj_type}' objects in '{device_group}':")
+    for i, entry in enumerate(entries, start=1):
+        print(f"  [{i}] {entry['name']}")
+    raw = input("Move numbers to shared (comma-separated, 'a' = all): ") \
+        .strip().lower()
+    if raw in ("a", "all"):
+        selected = list(entries)
+    else:
+        nums = []
+        for part in raw.replace(" ", ",") .split(","):
+            if part.isdigit() and 1 <= int(part) <= len(entries):
+                nums.append(int(part))
+        selected = [entries[i - 1] for i in dict.fromkeys(nums)]
+    if not selected:
+        print("Nothing selected.")
+        return
+    print(f"\nMove into '{SHARED_LABEL}' (name and all properties kept):")
+    moves, skips = [], []
+    for entry in selected:
+        name = entry["name"]
+        if _shared_exists(client, obj_type, name):
+            skips.append(name)
+            print(f"  SKIP  {name} (already exists in shared - will not "
+                  "overwrite)")
+        else:
+            moves.append(entry)
+            print(f"  MOVE  {name}")
+    if not moves:
+        print("Nothing to move: all selected names already exist in shared.")
+        return
+    if input("Type 'yes' to move these objects: ").strip().lower() != "yes":
+        print("Move cancelled.")
+        return
+    moved, partial, failed = [], [], []
+    for entry in moves:
+        name = entry["name"]
+        if _shared_exists(client, obj_type, name):
+            skips.append(name)
+            continue
+        fields = {k: v for k, v in entry.items() if k != "name"}
+        ok, err = write_object(client, SHARED_LABEL, obj_type, name, fields,
+                               existed=False)
+        if not ok:
+            failed.append((name, err))
+            continue
+        ok2, err2 = delete_object(client, device_group, obj_type, name)
+        if ok2:
+            moved.append(name)
+        else:
+            partial.append((name, err2))
+    client._running_config = None
+    note = f"Moved {len(moved)} object(s) into '{SHARED_LABEL}'"
+    if skips:
+        note += f", skipped {len(skips)} shared duplicate(s)"
+    print(f"\n{note}.")
+    for name, err in partial:
+        print(f"  WARNING {name}: created in shared but still present in "
+              f"'{device_group}': {err}", file=sys.stderr)
+    for name, err in failed[:5]:
+        print(f"  FAILED {name}: {err}", file=sys.stderr)
+    if len(failed) > 5:
+        print(f"  ... and {len(failed) - 5} more failures", file=sys.stderr)
+    if moved or partial:
+        actions = ["commit changes", "leave pending"]
+        action = choose(actions, "Post-move")
+        if action == actions[0]:
+            commit_changes(client)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Panorama interactive object browser")
     parser.add_argument("--host", default=env_or_default("PANORAMA_HOST"),
@@ -1253,8 +1346,10 @@ def main() -> None:
     device_group = choose(groups, "Device groups")
     print(f"Selected device group: {device_group}")
 
-    # 3. Action: list, export or import.
+    # 3. Action: list, export, import, or move objects to shared.
     actions = ["list objects", "export to CSV/JSON", "import from CSV/JSON file"]
+    if device_group != SHARED_LABEL:
+        actions.append("move object(s) to shared")
     if args.output == "text":
         action = choose(actions, "Action")
     else:
@@ -1267,7 +1362,9 @@ def main() -> None:
     # 4. Object type.
     obj_type = choose(OBJECT_TYPES, "Object types")
 
-    if action == actions[1]:
+    if action.startswith("move "):
+        move_to_shared(client, device_group, obj_type)
+    elif action == actions[1]:
         out_fmt = args.output
         if out_fmt == "text":
             out_fmt = choose(["csv", "json"], "Export format")

@@ -26,6 +26,7 @@ Interactive flow:
 ```
 Device groups   -> pick one (number), or "(shared)" for shared objects
 Action          -> [1] list objects   [2] export CSV/JSON   [3] import CSV/JSON
+                   [4] move object(s) to shared   (only for device groups)
 Object types    -> pick one (address, service, ...)
 ```
 
@@ -85,6 +86,18 @@ Existing objects are detected via the REST API and overwritten automatically
 objects in place.
 The post-import commit is tried the same way (classic XML `type=commit`
 command first, REST `Commit` endpoint as fallback).
+
+## Move objects to shared
+
+Choose **move object(s) to shared** in the Action menu (only offered when a
+real device group is selected). Pick object type, then select entries by
+number (`a` = all). Each selected object is recreated in **(shared)** with the
+same name and all properties, then deleted from the device group. Names that
+already exist as shared objects are **skipped, never overwritten**. Objects
+are committed from the post-move menu, like imports.
+
+Note: source objects are read from the committed (running) config, so
+uncommitted changes made in the Panorama UI are not included in a move.
 
 One file may mix object types if it declares them:
 
