@@ -810,6 +810,29 @@ def commit_changes(client: PanoramaClient) -> None:
         print("Commit skipped; changes stay in the candidate config.")
         return
     errors = []
+    desc_xml = f"<description>{escape(description)}</description>" \
+        if description else ""
+    # Classic XML commit (type=commit) first; some 12.1 builds lack a REST
+    # Commit route.
+    try:
+        result = client._request(
+            {"type": "commit", "cmd": f"<commit>{desc_xml}</commit>"})
+        client._running_config = None
+        printed = False
+        if isinstance(result, dict):
+            msg = result.get("msg")
+            if isinstance(msg, dict) and msg.get("line"):
+                print(msg["line"])
+                printed = True
+            if result.get("job"):
+                print(f"Commit job id: {result['job']}")
+                printed = True
+        if not printed:
+            print("Commit command accepted (job queued on Panorama).")
+        print("Monitor progress in Panorama: show jobs id <id> (UI or CLI).")
+        return
+    except RuntimeError as exc:
+        errors.append(f"XML API: {exc}")
     try:
         data = client.rest_commit(description)
         client._running_config = None
@@ -818,24 +841,10 @@ def commit_changes(client: PanoramaClient) -> None:
         return
     except RuntimeError as exc:
         errors.append(f"REST API: {exc}")
-    desc_xml = f"<description>{escape(description)}</description>" \
-        if description else ""
-    try:
-        result = client._request(
-            {"type": "commit", "cmd": f"<commit>{desc_xml}</commit>"})
-        client._running_config = None
-        if isinstance(result, dict) and result:
-            print(f"Commit job started: {result}")
-        else:
-            print("Commit command accepted (job queued on Panorama).")
-        print("Monitor progress in Panorama: show jobs id <id> (UI or CLI).")
-    except RuntimeError as exc:
-        errors.append(f"XML API: {exc}")
-    if errors:
-        for err in errors:
-            print(f"commit failed - {err}", file=sys.stderr)
-        print("You can still commit from the Panorama UI (Commit button) or "
-              "CLI ('commit').", file=sys.stderr)
+    for err in errors:
+        print(f"commit failed - {err}", file=sys.stderr)
+    print("You can still commit from the Panorama UI (Commit button) or "
+          "CLI ('commit').", file=sys.stderr)
 
 
 def revert_import(client: PanoramaClient, device_group: str,
