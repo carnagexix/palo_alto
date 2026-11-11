@@ -269,8 +269,9 @@ class PanoramaClient:
         query = {"key": self.api_key, "api-version": API_VERSION}
         query.update(params)
         url = f"https://{self.host}{path or '/api/' + API_VERSION}"
-        resp = self.session.get(url, params=query, timeout=self.timeout,
-                                verify=False)
+        resp = self.session.get(
+            url, params=query, timeout=self.timeout, verify=False,
+            headers={"X-PAN-KEY": self.api_key})
         return f"HTTP {resp.status_code}\n{resp.text[:3000]}"
 
     def rest_v13(self, resource: str, params: dict | None = None):
@@ -926,23 +927,24 @@ def run_diagnostics(client: PanoramaClient) -> None:
          {"type": "config", "action": "show"}, ""),
         ("config GET (candidate) /dev/group - expected empty on 12.x",
          {"type": "config", "action": "get", "path": "/dev/group"}, ""),
-        ("new REST API v13 device-group",
+        ("new REST shim /api/rest/v13 device-group",
          {"panorama": "LocalDevice", "type": "device-group"},
          "/api/rest/v13/device-group"),
-        ("v13 device-group (no type param)",
-         {"panorama": "LocalDevice"}, "/api/rest/v13/device-group"),
-        ("v13 address (panorama+device-group)",
-         {"panorama": "LocalDevice", "device-group": "Physical",
-          "limit": "5"}, "/api/rest/v13/address"),
-        ("v13 address (panorama only)",
-         {"panorama": "LocalDevice", "limit": "5"},
-         "/api/rest/v13/address"),
+        ("modern REST v12: address objects in shared",
+         {"location": "shared", "limit": "3"},
+         "/restapi/v12.0/Objects/Addresses"),
+        ("modern REST v12: address objects in device-group 'Physical'",
+         {"location": "device-group", "device-group": "Physical",
+          "limit": "3"},
+         "/restapi/v12.0/Objects/Addresses"),
+        ("modern REST v12: device groups",
+         {"panorama": "LocalDevice", "limit": "20"},
+         "/restapi/v12.0/DeviceGroups"),
+        ("modern REST v11: address objects in shared",
+         {"location": "shared", "limit": "3"},
+         "/restapi/v11.0/Objects/Addresses"),
         ("REST API docs index",
          {}, "/restapi-doc/"),
-        ("REST API v13 openapi spec (first 3000 chars)",
-         {}, "/restapi-doc/v13/openapi.json"),
-        ("REST API docs v13 index",
-         {}, "/restapi-doc/v13/index.html"),
     ]
     for label, params, path in probes:
         print(f"\n===== {label} =====", file=sys.stderr)
