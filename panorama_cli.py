@@ -56,7 +56,7 @@ OBJECT_TYPES = [
 ]
 # Order in which object types are applied so references resolve (groups
 # reference addresses/services, objects reference tags).
-BUILD = "2026-11-12b (list-form REST causes + protocol case flip)"
+BUILD = "2026-11-12c (protocol shape variants + dependency-ordered revert)"
 APPLY_ORDER = ["tag", "application", "service", "service-group", "address",
                "address-group"]
 DG_GROUPS = ("DevGroup", "DynGroup")  # static and dynamic device groups
@@ -490,17 +490,25 @@ class PanoramaClient:
         data = try_body(first, full_body, "")
         if data is None and conflict:
             data = try_body(other, full_body, "")
-        # protocol enum case varies by build: try the other case once
+        # this build's Services endpoint is picky about the protocol field's
+        # JSON shape (plain string vs member list, and its case); try variants
         if (data is None and isinstance(obj.get("protocol"), str)
                 and any("protocol" in e.lower() for e in errors[-3:])):
-            flipped = dict(obj)
-            pv = flipped["protocol"]
-            flipped["protocol"] = (pv.upper() if pv.islower()
-                                   else pv.lower())
-            alt_body = self._rest_body(name, device_group, flipped)
-            data = try_body(first, alt_body, " [protocol flip]")
-            if data is None and conflict:
-                data = try_body(other, alt_body, " [protocol flip]")
+            pv = obj["protocol"].strip()
+            alt_proto = [
+                (pv.upper(), " [protocol upper]"),
+                ({"member": [pv.lower()]}, " [protocol member]"),
+                ({"member": [pv.upper()]}, " [protocol member upper]"),
+            ]
+            for pval, note in alt_proto:
+                alt = json.loads(json.dumps(full_body))
+                for entry in alt.get("entry") or []:
+                    entry["protocol"] = pval
+                data = try_body(first, alt, note)
+                if data is None and conflict:
+                    data = try_body(other, alt, note)
+                if data is not None:
+                    break
         if data is None:
             dropped = _dropped_field_hint(" ".join(errors[-3:]), obj)
             if dropped:
@@ -1053,7 +1061,13 @@ def revert_import(client: PanoramaClient, device_group: str,
         print("Revert skipped.")
         return
     ok, failed = 0, []
-    for obj_type, name, existed, before in applied:
+    # delete dependents first (group -> address -> tag), then restore
+    applied = sorted(applied,
+                     key=lambda c: APPLY_ORDER.index(c[0])
+                     if c[0] in APPLY_ORDER else len(APPLY_ORDER))
+    for item in reversed([c for c in applied if not c[2]]) + \
+            [c for c in applied if c[2]]:
+        obj_type, name, existed, before = item
         if existed:
             good, err = write_object(client, device_group, obj_type, name,
                                      before, existed=True)
