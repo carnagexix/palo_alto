@@ -56,7 +56,7 @@ OBJECT_TYPES = [
 ]
 # Order in which object types are applied so references resolve (groups
 # reference addresses/services, objects reference tags).
-BUILD = "2026-11-12d (revert order fix, protocol variants, schema probe)"
+BUILD = "2026-11-12e (nested service protocol shape from schema probe)"
 APPLY_ORDER = ["tag", "application", "service", "service-group", "address",
                "address-group"]
 DG_GROUPS = ("DevGroup", "DynGroup")  # static and dynamic device groups
@@ -354,7 +354,7 @@ class PanoramaClient:
 
     @staticmethod
     def _rest_body(name: str, device_group: str, obj: dict,
-                   style: str = "full") -> dict:
+                   style: str = "full", obj_type: str = "") -> dict:
         fields: dict = {}
         for key, value in obj.items():
             if key == "name":
@@ -379,6 +379,16 @@ class PanoramaClient:
                          "member": member if isinstance(member, list)
                          else [member]}
             fields[key] = value
+        # this 12.1 build models custom services as a nested object keyed by
+        # the (lowercase) protocol name: "protocol": {"tcp": {"port": ...}}
+        if (obj_type == "service" and isinstance(fields.get("protocol"), str)
+                and "port" in fields):
+            proto = fields.pop("protocol")
+            spec: dict = {"port": fields.pop("port")}
+            sport = fields.pop("source-port", None)
+            if sport is not None and str(sport).lower() != "any":
+                spec["source-port"] = sport
+            fields["protocol"] = {proto: spec}
         entry: dict = {}
         if style == "plain":
             entry["name"] = name
@@ -486,23 +496,30 @@ class PanoramaClient:
                 return data
             return None
 
-        full_body = self._rest_body(name, device_group, obj)
+        full_body = self._rest_body(name, device_group, obj,
+                                     obj_type=obj_type)
         data = try_body(first, full_body, "")
         if data is None and conflict:
             data = try_body(other, full_body, "")
-        # this build's Services endpoint is picky about the protocol field's
-        # JSON shape (plain string vs member list, and its case); try variants
-        if (data is None and isinstance(obj.get("protocol"), str)
+        # the default service body is {"tcp": {"port": ...}}; if still
+        # refused, try the richer shapes seen on existing service entries
+        if (data is None and obj_type == "service"
+                and isinstance(obj.get("protocol"), str)
                 and any("protocol" in e.lower() for e in errors[-3:])):
-            pv = obj["protocol"].strip()
-            alt_proto = [
-                (pv.upper(), " [protocol upper]"),
-                ({"member": [pv.lower()]}, " [protocol member]"),
-                ({"member": [pv.upper()]}, " [protocol member upper]"),
-                ({"@type": pv.lower()}, " [protocol @type]"),
-                ({"@type": pv.upper()}, " [protocol @type upper]"),
-                ([pv.lower()], " [protocol list]"),
-            ]
+            pv = obj["protocol"].strip().lower()
+            spec: dict = {}
+            if obj.get("port") not in (None, ""):
+                spec["port"] = str(obj["port"])
+            alt_proto = []
+            if pv in ("tcp", "udp") and spec:
+                alt_proto = [
+                    ({pv: {**spec, "source-port":
+                           str(obj.get("source-port", "any") or "any")}},
+                     " [proto sport]"),
+                    ({pv: {**spec, "override": {"no": {}}}},
+                     " [proto override]"),
+                    ({pv.upper(): dict(spec)}, " [proto upper key]"),
+                ]
             for pval, note in alt_proto:
                 alt = json.loads(json.dumps(full_body))
                 for entry in alt.get("entry") or []:
@@ -519,7 +536,8 @@ class PanoramaClient:
                 print(f"WARNING REST: '{name}' rejected on optional field "
                       f"'{dropped}' ({errors[-1]}); retrying WITHOUT it "
                       f"- add it manually if needed", file=sys.stderr)
-                trim_body = self._rest_body(name, device_group, trimmed)
+                trim_body = self._rest_body(name, device_group, trimmed,
+                                            obj_type=obj_type)
                 data = try_body(first, trim_body, f" [no {dropped}]")
                 if data is None and conflict:
                     data = try_body(other, trim_body, f" [no {dropped}]")
