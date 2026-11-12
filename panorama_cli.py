@@ -313,12 +313,9 @@ class PanoramaClient:
         return {"location": "device-group", "device-group": device_group}
 
     @staticmethod
-    def _rest_body(name: str, device_group: str, obj: dict) -> dict:
-        entry = {"@location": ("shared" if device_group == SHARED_LABEL
-                               else "device-group"),
-                 "@name": name}
-        if device_group != SHARED_LABEL:
-            entry["@device-group"] = device_group
+    def _rest_body(name: str, device_group: str, obj: dict,
+                   style: str = "full") -> dict:
+        fields: dict = {}
         for key, value in obj.items():
             if key == "name":
                 continue
@@ -329,22 +326,55 @@ class PanoramaClient:
                 value = {**value,
                          "member": member if isinstance(member, list)
                          else [member]}
-            entry[key] = value
+            fields[key] = value
+        entry: dict = {}
+        if style == "plain":
+            entry["name"] = name
+        else:
+            entry["@location"] = ("shared" if device_group == SHARED_LABEL
+                                  else "device-group")
+            entry["@name"] = name
+            if style == "full" and device_group != SHARED_LABEL:
+                entry["@device-group"] = device_group
+        entry.update(fields)
         return {"entry": [entry]}
+
+    @staticmethod
+    def _rest_absent(exc) -> bool:
+        return any(w in str(exc).lower() for w in
+                   ("not present", "not found", "not exist", "does not",
+                    "no object", "http 404"))
+
+    def _rest_location_attempts(self, device_group: str,
+                                base_params: dict) -> list[dict]:
+        """Param sets to try: device-group writes on some 12.1 REST builds
+        only work when the 'panorama' query parameter is added."""
+        if device_group == SHARED_LABEL:
+            return [base_params]
+        plain = dict(base_params)
+        pano = {**base_params, "panorama": "LocalDevice"}
+        cached = getattr(self, "_dg_style", None)
+        if cached and cached[1]:
+            return [pano, plain]
+        return [plain, pano]
 
     def rest_get_entry(self, obj_type: str, device_group: str,
                        name: str) -> dict | None:
         """Return the REST view of one object (None if absent/not readable)."""
         resource = REST_RESOURCES[obj_type]
         params = {**self._rest_location(device_group), "name": name}
-        try:
-            data = self._rest("GET", f"{self.rest_base()}/{resource}", params)
-        except RuntimeError as exc:
-            if any(w in str(exc).lower() for w in
-                   ("not present", "not found", "not exist", "does not",
-                    "no object", "http 404")):
-                return None
-            raise
+        last: RuntimeError | None = None
+        data = None
+        for p in self._rest_location_attempts(device_group, params):
+            try:
+                data = self._rest("GET", f"{self.rest_base()}/{resource}", p)
+                break
+            except RuntimeError as exc:
+                if self._rest_absent(exc):
+                    return None
+                last = exc
+        if data is None:
+            raise last  # type: ignore[misc]
         result = data.get("result") if isinstance(data.get("result"), dict) \
             else data
         entries = result.get("entry") if isinstance(result, dict) else None
@@ -357,40 +387,84 @@ class PanoramaClient:
 
     def rest_write(self, obj_type: str, device_group: str, name: str,
                    obj: dict, create: bool) -> dict:
+        """Create/update via REST, probing request formats the box accepts.
+
+        Some 12.1 REST builds answer device-group writes with
+        'Invalid Object' unless 'panorama=LocalDevice' is present and/or the
+        entry omits the @device-group/@location attributes. We try the
+        combinations in order and remember the winning one."""
         resource = REST_RESOURCES[obj_type]
-        params = {**self._rest_location(device_group), "name": name}
-        body = self._rest_body(name, device_group, obj)
         base = self.rest_base()
-
-        def call(method: str) -> dict:
-            return self._rest(method, f"{base}/{resource}", params, body)
-
+        params = {**self._rest_location(device_group), "name": name}
         first = "POST" if create else "PUT"
         other = "PUT" if create else "POST"
-        try:
-            return call(first)
-        except RuntimeError as exc:
-            if not any(w in str(exc).lower() for w in
-                       ("unique", "exist", "already", "not found")):
-                raise
-            errors = [f"{first}: {exc}"]
-        try:
-            return call(other)
-        except RuntimeError as exc:
-            errors.append(f"{other}: {exc}")
-        # last resort: replace (delete then create)
+        errors: list[str] = []
+        conflict = False
+
+        if device_group == SHARED_LABEL:
+            styles = [("full", False)]
+        else:
+            styles = [("full", True), ("full", False), ("minimal", True),
+                      ("minimal", False), ("plain", True), ("plain", False)]
+            cached = getattr(self, "_dg_style", None)
+            if cached and cached in styles:
+                styles.remove(cached)
+                styles.insert(0, cached)
+
+        def try_verb(method: str):
+            nonlocal conflict
+            for style, pano in styles:
+                p = dict(params)
+                if pano:
+                    p["panorama"] = "LocalDevice"
+                tag = f"{method} {style}{' +panorama' if pano else ''}"
+                try:
+                    data = self._rest(method, f"{base}/{resource}", p,
+                                      self._rest_body(name, device_group, obj,
+                                                      style))
+                except RuntimeError as exc:
+                    errors.append(f"{tag}: {exc}")
+                    if any(w in str(exc).lower() for w in
+                           ("unique", "exist", "already", "not found")):
+                        conflict = True
+                        break
+                    continue
+                if device_group != SHARED_LABEL:
+                    self._dg_style = (style, pano)
+                return data
+            return None
+
+        data = try_verb(first)
+        if data is not None:
+            return data
+        if not conflict:
+            raise RuntimeError("; ".join(errors[-2:]))
+        data = try_verb(other)
+        if data is not None:
+            return data
         try:
             self.rest_delete(obj_type, device_group, name)
-            return call("POST")
         except RuntimeError as exc:
             errors.append(f"replace: {exc}")
-        raise RuntimeError("; ".join(errors))
+        else:
+            data = try_verb("POST")
+            if data is not None:
+                return data
+        raise RuntimeError("; ".join(errors[-2:]))
 
     def rest_delete(self, obj_type: str, device_group: str,
                     name: str) -> dict:
         resource = REST_RESOURCES[obj_type]
         params = {**self._rest_location(device_group), "name": name}
-        return self._rest("DELETE", f"{self.rest_base()}/{resource}", params)
+        last: RuntimeError | None = None
+        for p in self._rest_location_attempts(device_group, params):
+            try:
+                return self._rest("DELETE", f"{self.rest_base()}/{resource}", p)
+            except RuntimeError as exc:
+                if self._rest_absent(exc):
+                    return {}
+                last = exc
+        raise last  # type: ignore[misc]
 
     def rest_commit(self, description: str) -> dict:
         base = self.rest_base()
