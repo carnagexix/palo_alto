@@ -56,7 +56,7 @@ OBJECT_TYPES = [
 ]
 # Order in which object types are applied so references resolve (groups
 # reference addresses/services, objects reference tags).
-BUILD = "2026-11-12c (protocol shape variants + dependency-ordered revert)"
+BUILD = "2026-11-12d (revert order fix, protocol variants, schema probe)"
 APPLY_ORDER = ["tag", "application", "service", "service-group", "address",
                "address-group"]
 DG_GROUPS = ("DevGroup", "DynGroup")  # static and dynamic device groups
@@ -499,6 +499,9 @@ class PanoramaClient:
                 (pv.upper(), " [protocol upper]"),
                 ({"member": [pv.lower()]}, " [protocol member]"),
                 ({"member": [pv.upper()]}, " [protocol member upper]"),
+                ({"@type": pv.lower()}, " [protocol @type]"),
+                ({"@type": pv.upper()}, " [protocol @type upper]"),
+                ([pv.lower()], " [protocol list]"),
             ]
             for pval, note in alt_proto:
                 alt = json.loads(json.dumps(full_body))
@@ -531,6 +534,15 @@ class PanoramaClient:
             data = try_body("POST", full_body, "")
             if data is not None:
                 return data
+        if self.debug and obj_type in REST_RESOURCES:
+            # dump how the box itself serialises this object type so the
+            # expected request schema can be read off an existing entry
+            for probe in ({**self._rest_location(device_group),
+                           "limit": 5}, {"location": "shared", "limit": 3}):
+                try:
+                    self._rest("GET", f"{base}/{resource}", probe)
+                except RuntimeError:
+                    pass
         raise RuntimeError("; ".join(errors[-2:]))
 
     def rest_delete(self, obj_type: str, device_group: str,
@@ -1065,9 +1077,9 @@ def revert_import(client: PanoramaClient, device_group: str,
     applied = sorted(applied,
                      key=lambda c: APPLY_ORDER.index(c[0])
                      if c[0] in APPLY_ORDER else len(APPLY_ORDER))
-    for item in reversed([c for c in applied if not c[2]]) + \
-            [c for c in applied if c[2]]:
-        obj_type, name, existed, before = item
+    ordered = (list(reversed([c for c in applied if not c[2]]))
+               + [c for c in applied if c[2]])
+    for obj_type, name, existed, before in ordered:
         if existed:
             good, err = write_object(client, device_group, obj_type, name,
                                      before, existed=True)
