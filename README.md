@@ -24,6 +24,8 @@ automatically.
 Interactive flow:
 
 ```
+Mode            -> [1] explore device-group objects   [2] find where an object is used
+Mode 1 (explore):
 Device groups   -> pick one (number), or "(shared)" for shared objects
 Action          -> [1] list objects   [2] export CSV/JSON   [3] import CSV/JSON
                    [4] copy/move object(s) to shared   (only for device groups)
@@ -118,6 +120,29 @@ Flow mirrors import:
 
 Note: source objects are read from the committed (running) config, so
 uncommitted changes made in the Panorama UI are not included in a move.
+
+## Where is an object used?
+
+Choose **find where an object is used (rule search)** in the Mode menu. Type
+an object name, IP address or (address/service) group name; the tool searches
+the **committed** running config across **all device groups and shared**:
+
+- matches objects by name (substring, case-insensitive) or by IP value
+  (`ip-netmask` / `ip-range` / `ip-wildcard` contains the query);
+- resolves address groups and address groups in rules (transitively) so a
+  rule using `grp-servers` counts as using a member address object;
+- scans every security, NAT and PBR rulebase (pre-/post-rulebase included)
+  in each device group;
+- output per rule: location, rulebase, rule name, which fields referenced
+  the object (directly or via a group), and the rule's from/to/source/dest/
+  service/application/action.
+
+Results are written to `where-used_<query>_<timestamp>.txt|.csv|.json` in the
+current directory (and printed to the screen in text mode).
+
+Note: object resolution is by name across all device groups and shared;
+cross-device-group scoping nuances (e.g. a group with the same name in two
+device groups) are not modelled.
 
 One file may mix object types if it declares them:
 
