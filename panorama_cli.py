@@ -56,6 +56,7 @@ OBJECT_TYPES = [
 ]
 # Order in which object types are applied so references resolve (groups
 # reference addresses/services, objects reference tags).
+BUILD = "2026-11-12a (0cdc03c: REST detail causes + drop-retry)"
 APPLY_ORDER = ["tag", "application", "service", "service-group", "address",
                "address-group"]
 DG_GROUPS = ("DevGroup", "DynGroup")  # static and dynamic device groups
@@ -1613,6 +1614,7 @@ def main() -> None:
                         help="object listing format; json/csv are saved to "
                              "<device_group>_<obj_type>.<ext> in the CWD")
     args = parser.parse_args()
+    print(f"panorama_cli.py build {BUILD}")
 
     if not args.host:
         if len(sys.argv) == 1:
