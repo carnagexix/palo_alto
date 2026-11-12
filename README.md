@@ -84,6 +84,12 @@ delete in that case; both are tried and combined errors are shown if both fail.
 Device-group REST writes are auto-probed across request formats (with/without
 the `panorama=LocalDevice` query parameter and different `@`-attribute
 styles), because some 12.1 builds answer them with `400 Invalid Object`.
+REST validation reasons from the server (`Invalid Object: ...` details) are
+shown in the FAILED lines. Imports apply types in dependency order
+(tag -> application/service -> address -> groups) so group/tag references
+resolve; `tag` strings and lowercase `protocol` values are normalized for
+REST, and if the box rejects an optional field's enum value (e.g. a tag
+color), the field is dropped from that write with a loud WARNING.
 Existing objects are detected via the REST API and overwritten automatically
 (POST -> PUT -> delete+create cascade), so re-importing an updated file updates
 objects in place.

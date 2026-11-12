@@ -54,6 +54,10 @@ OBJECT_TYPES = [
     "application",
     "tag",
 ]
+# Order in which object types are applied so references resolve (groups
+# reference addresses/services, objects reference tags).
+APPLY_ORDER = ["tag", "application", "service", "service-group", "address",
+               "address-group"]
 DG_GROUPS = ("DevGroup", "DynGroup")  # static and dynamic device groups
 SHARED_LABEL = "(shared)"  # pseudo group for shared objects
 # Modern REST API (/restapi/<ver>/...); 12.1 was verified to serve v11.0.
@@ -66,6 +70,26 @@ REST_RESOURCES = {
     "application": "Objects/Applications",
     "tag": "Objects/Tags",
 }
+# Optional object fields we are allowed to drop (with a warning) if the REST
+# build's enum rejects their value; key -> message aliases to look for.
+DROPPABLE_FIELDS = {
+    "color": ("color",),
+    "tag": ("tag",),
+    "comments": ("comments",),
+    "description": ("description",),
+    "source-port": ("source-port", "source_port"),
+    "source_port": ("source-port", "source_port"),
+}
+
+
+def _dropped_field_hint(error_text: str, obj: dict) -> str | None:
+    """Name of a droppable field the server complained about, if any."""
+    low = error_text.lower()
+    for key in obj:
+        aliases = DROPPABLE_FIELDS.get(key.lower())
+        if aliases and any(a in low for a in aliases):
+            return key
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -284,6 +308,13 @@ class PanoramaClient:
             str(data.get("@status", "success")).lower() == "success"
         if not ok:
             msg = data.get("message") or data.get("msg") or resp.text[:200]
+            details = data.get("details")
+            if isinstance(details, dict):
+                causes = [c.get("description")
+                          for c in details.get("causes") or []
+                          if isinstance(c, dict) and c.get("description")]
+                if causes:
+                    msg = f"{msg} ({'; '.join(causes)})"
             raise RuntimeError(
                 f"REST {method} {path} (HTTP {resp.status_code} "
                 f"code {data.get('code')}): {msg}")
@@ -319,7 +350,19 @@ class PanoramaClient:
         for key, value in obj.items():
             if key == "name":
                 continue
-            if key.endswith("member") or key in ("member",):
+            lkey = key.lower()
+            if lkey == "protocol" and isinstance(value, str):
+                # REST enum for service protocol is lower-case (xml uses TCP)
+                value = value.lower()
+            elif lkey == "tag" and isinstance(value, (str, list)):
+                # REST wants tag as {"member": [...]}, XML tolerated a string
+                value = {"member": value if isinstance(value, list)
+                         else [value]}
+            elif lkey == "static" and isinstance(value, str):
+                # accept "a, b, c" as member list
+                value = {"member": [s.strip() for s in value.split(",")
+                                    if s.strip()]}
+            elif key.endswith("member") or key in ("member",):
                 value = value if isinstance(value, list) else [value]
             elif isinstance(value, dict) and "member" in value:
                 member = value["member"]
@@ -392,7 +435,9 @@ class PanoramaClient:
         Some 12.1 REST builds answer device-group writes with
         'Invalid Object' unless 'panorama=LocalDevice' is present and/or the
         entry omits the @device-group/@location attributes. We try the
-        combinations in order and remember the winning one."""
+        combinations in order and remember the winning one. If the server
+        then still rejects a *named optional field* (e.g. an enum mismatch),
+        we retry once without that field and warn loudly."""
         resource = REST_RESOURCES[obj_type]
         base = self.rest_base()
         params = {**self._rest_location(device_group), "name": name}
@@ -411,17 +456,15 @@ class PanoramaClient:
                 styles.remove(cached)
                 styles.insert(0, cached)
 
-        def try_verb(method: str):
+        def try_body(method: str, body: dict, note: str):
             nonlocal conflict
             for style, pano in styles:
                 p = dict(params)
                 if pano:
                     p["panorama"] = "LocalDevice"
-                tag = f"{method} {style}{' +panorama' if pano else ''}"
+                tag = f"{method} {style}{' +panorama' if pano else ''}{note}"
                 try:
-                    data = self._rest(method, f"{base}/{resource}", p,
-                                      self._rest_body(name, device_group, obj,
-                                                      style))
+                    data = self._rest(method, f"{base}/{resource}", p, body)
                 except RuntimeError as exc:
                     errors.append(f"{tag}: {exc}")
                     if any(w in str(exc).lower() for w in
@@ -434,20 +477,30 @@ class PanoramaClient:
                 return data
             return None
 
-        data = try_verb(first)
+        full_body = self._rest_body(name, device_group, obj)
+        data = try_body(first, full_body, "")
+        if data is None and conflict:
+            data = try_body(other, full_body, "")
+        if data is None:
+            dropped = _dropped_field_hint(" ".join(errors[-3:]), obj)
+            if dropped:
+                trimmed = {k: v for k, v in obj.items() if k != dropped}
+                print(f"WARNING REST: '{name}' rejected on optional field "
+                      f"'{dropped}' ({errors[-1]}); retrying WITHOUT it "
+                      f"- add it manually if needed", file=sys.stderr)
+                trim_body = self._rest_body(name, device_group, trimmed)
+                data = try_body(first, trim_body, f" [no {dropped}]")
+                if data is None and conflict:
+                    data = try_body(other, trim_body, f" [no {dropped}]")
         if data is not None:
             return data
-        if not conflict:
-            raise RuntimeError("; ".join(errors[-2:]))
-        data = try_verb(other)
-        if data is not None:
-            return data
+        # last resort: replace (delete then create)
         try:
             self.rest_delete(obj_type, device_group, name)
         except RuntimeError as exc:
             errors.append(f"replace: {exc}")
         else:
-            data = try_verb("POST")
+            data = try_body("POST", full_body, "")
             if data is not None:
                 return data
         raise RuntimeError("; ".join(errors[-2:]))
@@ -1077,6 +1130,11 @@ def import_objects(client: PanoramaClient, device_group: str) -> None:
         if obj_type not in OBJECT_TYPES:
             print(f"warning: '{obj_type}' is not in the known object list, "
                   f"importing anyway.", file=sys.stderr)
+    # Apply in dependency order so groups/tag references exist when used.
+    groups = dict(sorted(
+        groups.items(),
+        key=lambda kv: APPLY_ORDER.index(kv[0]) if kv[0] in APPLY_ORDER
+        else len(APPLY_ORDER)))
 
     # Snapshot the current state of every object we are about to touch.
     print("\nSnapshotting current state of target objects ...")
