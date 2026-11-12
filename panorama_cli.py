@@ -56,7 +56,7 @@ OBJECT_TYPES = [
 ]
 # Order in which object types are applied so references resolve (groups
 # reference addresses/services, objects reference tags).
-BUILD = "2026-11-12a (0cdc03c: REST detail causes + drop-retry)"
+BUILD = "2026-11-12b (list-form REST causes + protocol case flip)"
 APPLY_ORDER = ["tag", "application", "service", "service-group", "address",
                "address-group"]
 DG_GROUPS = ("DevGroup", "DynGroup")  # static and dynamic device groups
@@ -297,6 +297,8 @@ class PanoramaClient:
         if self.debug:
             print(f"REST {method} {url}", file=sys.stderr)
             print(f"params: {query}", file=sys.stderr)
+            if payload is not None:
+                print(f"body: {payload}", file=sys.stderr)
             print(f"HTTP {resp.status_code}\n{resp.text[:2000]}",
                   file=sys.stderr)
         try:
@@ -309,11 +311,17 @@ class PanoramaClient:
             str(data.get("@status", "success")).lower() == "success"
         if not ok:
             msg = data.get("message") or data.get("msg") or resp.text[:200]
+            # this build nests causes under details[0], not details
             details = data.get("details")
-            if isinstance(details, dict):
-                causes = [c.get("description")
-                          for c in details.get("causes") or []
-                          if isinstance(c, dict) and c.get("description")]
+            if details:
+                blocks = details if isinstance(details, list) else [details]
+                causes = []
+                for block in blocks:
+                    if not isinstance(block, dict):
+                        continue
+                    for c in block.get("causes") or []:
+                        if isinstance(c, dict) and c.get("description"):
+                            causes.append(c["description"])
                 if causes:
                     msg = f"{msg} ({'; '.join(causes)})"
             raise RuntimeError(
@@ -482,6 +490,17 @@ class PanoramaClient:
         data = try_body(first, full_body, "")
         if data is None and conflict:
             data = try_body(other, full_body, "")
+        # protocol enum case varies by build: try the other case once
+        if (data is None and isinstance(obj.get("protocol"), str)
+                and any("protocol" in e.lower() for e in errors[-3:])):
+            flipped = dict(obj)
+            pv = flipped["protocol"]
+            flipped["protocol"] = (pv.upper() if pv.islower()
+                                   else pv.lower())
+            alt_body = self._rest_body(name, device_group, flipped)
+            data = try_body(first, alt_body, " [protocol flip]")
+            if data is None and conflict:
+                data = try_body(other, alt_body, " [protocol flip]")
         if data is None:
             dropped = _dropped_field_hint(" ".join(errors[-3:]), obj)
             if dropped:
