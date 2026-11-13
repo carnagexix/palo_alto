@@ -56,7 +56,7 @@ OBJECT_TYPES = [
 ]
 # Order in which object types are applied so references resolve (groups
 # reference addresses/services, objects reference tags).
-BUILD = "2026-11-13f (rule search: list object names, csv/json export, repeat)"
+BUILD = "2026-11-13g (rule search: add addresses/groups to found rules)"
 APPLY_ORDER = ["tag", "application", "service", "service-group", "address",
                "address-group"]
 DG_GROUPS = ("DevGroup", "DynGroup")  # static and dynamic device groups
@@ -617,6 +617,33 @@ class PanoramaClient:
                 last = exc
         raise last  # type: ignore[misc]
 
+    def rest_rule_update(self, device_group: str, rulebase: str,
+                         rule_name: str, rule: dict) -> dict:
+        """Update one rule via the modern REST API, probing the endpoint and
+        method this build exposes (/Rules vs /Objects/Rules, POST vs PUT).
+
+        rulebase is e.g. 'rulebase/security' or 'pre-rulebase/nat'; the rule
+        dict is the full (merged) rule body read from the running config."""
+        kind = rulebase.split("/")[0]
+        base = self.rest_base()
+        loc = self._rest_location(device_group)
+        entry = {k: v for k, v in rule.items() if k != "name"}
+        entry["@name"] = rule_name
+        entry["@rulebase"] = kind
+        body = {"entry": [entry]}
+        last: RuntimeError | None = None
+        for endpoint in ("/Rules", "/Objects/Rules"):
+            for method in ("POST", "PUT"):
+                params = {**loc, "rulebase": kind, "name": rule_name}
+                if device_group != SHARED_LABEL:
+                    params["panorama"] = "LocalDevice"
+                try:
+                    return self._rest(method, f"{base}{endpoint}", params,
+                                      body)
+                except RuntimeError as exc:
+                    last = exc
+        raise last  # type: ignore[misc]
+
     def rest_commit(self, description: str) -> dict:
         base = self.rest_base()
         body = {"type": "commit"}
@@ -930,8 +957,8 @@ def xpath_quote(value: str) -> str:
     return value.replace("'", "''")
 
 
-def obj_to_xml(obj: dict) -> str:
-    """Render an exported object dict back into PAN-OS element XML."""
+def xml_value(tag: str, value) -> str:
+    """Render a (possibly nested) dict/list value as XML under one tag."""
     def esc(value: str, attr: bool = False) -> str:
         entities = {'"': "&quot;"} if attr else {}
         return escape(str(value), entities)
@@ -948,7 +975,16 @@ def obj_to_xml(obj: dict) -> str:
             return f"<{tag}/>"
         return f"<{tag}>{esc(value)}</{tag}>"
 
-    inner = "".join(build(k, v) for k, v in obj.items() if k != "name")
+    return build(tag, value)
+
+
+def obj_to_xml(obj: dict) -> str:
+    """Render an exported object dict back into PAN-OS element XML."""
+    def esc(value: str, attr: bool = False) -> str:
+        entities = {'"': "&quot;"} if attr else {}
+        return escape(str(value), entities)
+
+    inner = "".join(xml_value(k, v) for k, v in obj.items() if k != "name")
     return f'<entry name="{esc(str(obj.get("name", "")), attr=True)}">{inner}</entry>'
 
 
@@ -960,6 +996,20 @@ def dg_set_paths(device_group: str, obj_type: str, name: str) -> list[str]:
     dg_sel = f"entry[@name='{xpath_quote(device_group)}']"
     return [f"/devices/LocalDevice/device-group/DevGroup/{dg_sel}/{obj_type}/{sel}",
             f"/dev/group/{dg_sel}/{obj_type}/{sel}"]
+
+
+def rule_field_paths(device_group: str, rulebase: str, rule_name: str,
+                     field: str) -> list[str]:
+    """XML-API set paths for one rule field (source/destination/...)."""
+    q = xpath_quote(rule_name)
+    if device_group == SHARED_LABEL:
+        root = "/shared"
+    else:
+        root = ("/devices/LocalDevice/device-group/DevGroup/"
+                f"entry[@name='{xpath_quote(device_group)}']")
+    return [f"{root}/rules/{rulebase}/name/{q}/{field}",
+            f"{root}/rules/{rulebase}/entry[@name='{q}']/{field}",
+            f"/devices/LocalDevice/rulebase/{rulebase}/rules/entry[@name='{q}']/{field}"]
 
 
 def read_import_file(path: str) -> dict[str, list[dict]]:
@@ -1539,6 +1589,8 @@ def _where_used_once(client: PanoramaClient, locations: list[str],
                 f"{f}: {'|'.join(ms)}" for f, ms in matched.items())
             rec["matched_objects"] = ", ".join(dict.fromkeys(matched_objs))
             rec["indirectly_via"] = "; ".join(dict.fromkeys(via_notes))
+            rec["_rule"] = rule
+            rec["_rb"] = rb
             records.append(rec)
 
     print(f"\nQuery '{query}': {len(direct)} matching object(s), "
@@ -1575,45 +1627,169 @@ def _where_used_once(client: PanoramaClient, locations: list[str],
               "contains them.")
 
     fmt = input("\nExport results (c=csv, j=json, Enter=skip): ").strip().lower()
-    if fmt not in ("c", "csv", "j", "json"):
+    if fmt in ("c", "csv", "j", "json"):
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        obj_rows = [{"name": objects[n]["name"], "type": objects[n]["type"],
+                     "location": objects[n]["location"],
+                     "summary": _obj_summary(objects[n]["fields"])}
+                    for n in sorted(direct)]
+        export_records = [{k: v for k, v in rec.items()
+                           if not k.startswith("_")} for rec in records]
+        if fmt in ("c", "csv"):
+            obj_path = safe_filename("where-used", f"{query}_objects_{ts}",
+                                     "csv")
+            with open(obj_path, "w", encoding="utf-8", newline="") as fh:
+                writer = csv.writer(fh)
+                writer.writerow(["name", "type", "location", "summary"])
+                for row in obj_rows:
+                    writer.writerow([row["name"], row["type"], row["location"],
+                                     row["summary"]])
+            print(f"Wrote {len(obj_rows)} object match(es) to {obj_path}")
+            rule_path = safe_filename("where-used", f"{query}_rules_{ts}",
+                                      "csv")
+            keys = (["location", "rulebase", "rule", "used_in",
+                     "matched_objects", "indirectly_via"] +
+                    [k for k in RULE_DETAIL_KEYS
+                     if k not in ("source", "destination", "service",
+                                  "application")])
+            keys = list(dict.fromkeys(keys))
+            with open(rule_path, "w", encoding="utf-8", newline="") as fh:
+                writer = csv.writer(fh)
+                writer.writerow(keys)
+                for rec in export_records:
+                    writer.writerow([rec.get(key, "") for key in keys])
+            print(f"Wrote {len(export_records)} rule reference(s) to "
+                  f"{rule_path}")
+        else:
+            path = safe_filename("where-used", f"{query}_{ts}", "json")
+            payload = {"query": query,
+                       "generated": datetime.now().isoformat(
+                           timespec="seconds"),
+                       "object_matches": obj_rows,
+                       "rule_references": export_records}
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, indent=2, ensure_ascii=False)
+            print(f"Wrote {len(obj_rows)} object match(es) and "
+                  f"{len(export_records)} rule reference(s) to {path}")
+
+    if records and input("\nAdd address/address-group objects to these rules? "
+                         "y to edit, Enter=skip: ").strip().lower() == "y":
+        _add_to_rules(client, objects, records)
+
+
+def _add_to_rules(client: PanoramaClient, objects: dict,
+                  records: list) -> None:
+    """Append address/address-group members to the source or destination
+    member list of the rules found in the current search."""
+    raw = input("Address or address-group object name(s) to add "
+                "(comma-separated, or '@file.txt' one per line): ") \
+        .strip().strip('"')
+    if not raw:
         return
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    obj_rows = [{"name": objects[n]["name"], "type": objects[n]["type"],
-                 "location": objects[n]["location"],
-                 "summary": _obj_summary(objects[n]["fields"])}
-                for n in sorted(direct)]
-    if fmt in ("c", "csv"):
-        obj_path = safe_filename("where-used", f"{query}_objects_{ts}", "csv")
-        with open(obj_path, "w", encoding="utf-8", newline="") as fh:
-            writer = csv.writer(fh)
-            writer.writerow(["name", "type", "location", "summary"])
-            for row in obj_rows:
-                writer.writerow([row["name"], row["type"], row["location"],
-                                 row["summary"]])
-        print(f"Wrote {len(obj_rows)} object match(es) to {obj_path}")
-        rule_path = safe_filename("where-used", f"{query}_rules_{ts}", "csv")
-        keys = (["location", "rulebase", "rule", "used_in",
-                 "matched_objects", "indirectly_via"] +
-                [k for k in RULE_DETAIL_KEYS
-                 if k not in ("source", "destination", "service",
-                              "application")])
-        keys = list(dict.fromkeys(keys))
-        with open(rule_path, "w", encoding="utf-8", newline="") as fh:
-            writer = csv.writer(fh)
-            writer.writerow(keys)
-            for rec in records:
-                writer.writerow([rec.get(key, "") for key in keys])
-        print(f"Wrote {len(records)} rule reference(s) to {rule_path}")
+    if raw.startswith("@") or raw.lower().endswith((".txt", ".csv")):
+        try:
+            names = _names_from_convert_file(
+                raw.lstrip("@").strip().strip('"').strip("'"))
+        except OSError as exc:
+            print(f"  Could not read file: {exc}")
+            return
     else:
-        path = safe_filename("where-used", f"{query}_{ts}", "json")
-        payload = {"query": query,
-                   "generated": datetime.now().isoformat(timespec="seconds"),
-                   "object_matches": obj_rows,
-                   "rule_references": records}
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh, indent=2, ensure_ascii=False)
-        print(f"Wrote {len(obj_rows)} object match(es) and {len(records)} "
-              f"rule reference(s) to {path}")
+        names = [t for t in raw.replace(",", " ").split() if t]
+    adds, missing, seen = [], [], set()
+    for name in names:
+        obj = objects.get(str(name).lower())
+        if not isinstance(obj, dict) or obj["type"] not in (
+                "address", "address-group"):
+            missing.append(name)
+            continue
+        if obj["name"].lower() not in seen:
+            seen.add(obj["name"].lower())
+            adds.append(obj["name"])
+    if missing:
+        print(f"  WARNING  {len(missing)} name(s) are not existing address/"
+              "address-group objects and will be skipped:")
+        for name in missing[:20]:
+            print(f"    ? {name}")
+        if len(missing) > 20:
+            print(f"    ... and {len(missing) - 20} more")
+    if not adds:
+        print("  No valid address/address-group objects to add.")
+        return
+
+    field = choose(["source", "destination", "both"], "Add members to field")
+    fields = ["source", "destination"] if field == "both" else [field]
+
+    plan, skipped, seen_plan = [], [], set()
+    for rec in records:
+        rule, rb = rec["_rule"], rec["_rb"]
+        for fld in fields:
+            key = (rec["location"], rb, rec["rule"], fld)
+            if key in seen_plan:
+                continue
+            seen_plan.add(key)
+            cur = rule.get(fld)
+            members = member_values(cur)
+            if not members:
+                skipped.append(f"[{rb}] {rec['location']}/{rec['rule']} "
+                               f"({fld}): no member list (e.g. 'any')")
+                continue
+            have = {m.lower() for m in members}
+            to_add = [a for a in adds if a.lower() not in have]
+            if not to_add:
+                continue
+            base = dict(cur) if isinstance(cur, dict) else {}
+            base.pop("member", None)
+            plan.append((rec, fld, {**base, "member":
+                                    list(members) + to_add}, to_add))
+    if skipped:
+        print("\n  Skipped rules (cannot append to a non-member field):")
+        for note in dict.fromkeys(skipped):
+            print(f"    {note}")
+    if not plan:
+        print("  Nothing to change: the members are already present in all "
+              "these rules.")
+        return
+
+    print(f"\nWill add to {len(plan)} rule field(s):")
+    for rec, fld, _val, to_add in plan:
+        print(f"  [{rec['_rb']}] {rec['location']}/{rec['rule']} {fld}: "
+              f"+ {', '.join(to_add)}")
+    if input("Type 'yes' to update these rules: ").strip().lower() != "yes":
+        print("Rule update cancelled.")
+        return
+
+    ok, failed = 0, []
+    for rec, fld, new_val, _to_add in plan:
+        loc, rb, rname = rec["location"], rec["_rb"], rec["rule"]
+        err = ""
+        done = False
+        element = xml_value(fld, new_val)
+        for path in rule_field_paths(loc, rb, rname, fld):
+            try:
+                client.config_set(path, element)
+                done = True
+                break
+            except RuntimeError as exc:
+                err = str(exc)
+        if not done:
+            full_rule = {k: v for k, v in rec["_rule"].items()
+                         if k != "name"}
+            full_rule[fld] = new_val
+            try:
+                client.rest_rule_update(loc, rb, rname, full_rule)
+                done = True
+            except RuntimeError as exc:
+                failed.append((f"{loc}/{rname} ({fld})",
+                               f"XML: {err}; REST rules: {exc}"))
+        if done:
+            ok += 1
+    print(f"\nUpdated {ok}/{len(plan)} rule field(s).")
+    for name, err in failed[:5]:
+        print(f"  FAILED {name}: {err}", file=sys.stderr)
+    if not failed:
+        actions = ["commit changes", "leave pending"]
+        if choose(actions, "Post-update") == actions[0]:
+            commit_changes(client)
 
 
 def _obj_summary(fields: dict) -> str:

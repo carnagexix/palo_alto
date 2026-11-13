@@ -168,6 +168,17 @@ Mode menu). At the `Export results` prompt: `c` writes
 `where-used_<query>_<ts>.json` containing both. Enter skips export (results
 are always printed to the screen).
 
+When rules were found, an extra prompt offers **adding address /
+address-group objects to those rules**: enter names comma-separated, or
+`@file.txt` with one name per line. Names that do not exist (or are not
+address/address-group objects) are **warned about and skipped**. Pick which
+field to extend (`source`, `destination` or `both`); rules whose field has
+no member list (e.g. `any`) are skipped with a note. Members already present
+are not duplicated. A preview of `+member` per rule is shown before anything
+is sent, then each rule field is updated via the XML API with the REST
+`/Rules` endpoint as fallback; afterwards you can commit or leave the rules
+pending.
+
 Note: object resolution is by name across all device groups and shared;
 cross-device-group scoping nuances (e.g. a group with the same name in two
 device groups) are not modelled.
