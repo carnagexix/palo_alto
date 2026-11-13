@@ -56,7 +56,7 @@ OBJECT_TYPES = [
 ]
 # Order in which object types are applied so references resolve (groups
 # reference addresses/services, objects reference tags).
-BUILD = "2026-11-13d (merged where-used into main menu flow)"
+BUILD = "2026-11-13e (app default.port members 'tcp/8001'; service-group 'members')"
 APPLY_ORDER = ["tag", "application", "service", "service-group", "address",
                "address-group"]
 DG_GROUPS = ("DevGroup", "DynGroup")  # static and dynamic device groups
@@ -389,6 +389,46 @@ class PanoramaClient:
             if sport is not None and str(sport).lower() != "any":
                 spec["source-port"] = sport
             fields["protocol"] = {proto: spec}
+        # service groups key their members as "members" (not "static" like
+        # address groups); custom applications carry protocol inside the port
+        # members under "default": {"port": {"member": ["tcp/8001"]}}
+        if obj_type == "service-group":
+            static_val = fields.pop("static", None)
+            if static_val is None:
+                static_val = fields.pop("members", None)
+            if isinstance(static_val, dict):
+                fields["members"] = static_val
+            elif isinstance(static_val, list):
+                fields["members"] = {"member": static_val}
+            elif static_val is not None:
+                fields["members"] = {"member": [str(static_val)]}
+        if obj_type == "application":
+            pval = fields.get("protocol")
+            protos: list[str] = []
+            if isinstance(pval, str):
+                protos = [pval.lower()]
+            elif isinstance(pval, list):
+                protos = [str(p).lower() for p in pval]
+            elif isinstance(pval, dict) and isinstance(pval.get("member"),
+                                                       (str, list)):
+                mem = pval["member"]
+                protos = [str(p).lower() for p in
+                          (mem if isinstance(mem, list) else [mem])]
+            praw = fields.get("port", "")
+            ports = [str(p).strip() for p in
+                     (praw if isinstance(praw, list)
+                      else str(praw).split(",")) if str(p).strip()]
+            if protos and ports:
+                fields.pop("protocol", None)
+                fields.pop("port", None)
+                spec = {"port": {"member": [f"{p}/{q}"
+                                            for p in protos for q in ports]}}
+                sport = fields.pop("source-port", None)
+                if sport is not None and str(sport).lower() != "any":
+                    spec["source-port"] = {
+                        "member": sport if isinstance(sport, list)
+                        else [str(sport)]}
+                fields["default"] = spec
         entry: dict = {}
         if style == "plain":
             entry["name"] = name
