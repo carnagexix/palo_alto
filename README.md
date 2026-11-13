@@ -172,13 +172,21 @@ When rules were found, an extra prompt offers **adding address /
 address-group objects to those rules**: enter names comma-separated, or
 `@file.txt` with one name per line. Names that do not exist (or are not
 address/address-group objects) are **warned about and skipped**. Members are
-added to the **same field the search hit** (source, destination, or both),
+added to the **same field the search hit** (`source`, `destination` - shown
+as `before: source: ...` / `before: destination: ...`),
 member lists only (rules where the field is `any` are skipped), and members
 already present are not duplicated. A before/after preview is shown per rule
 field before anything is sent; after applying, a diff
 (`where-used_<query>_rule-edit_<ts>.txt`) lists `UPDATED`/`FAILED` per rule
-with `- before:` / `+ after:` member lists, and you can **commit (with an
-optional description)** or leave the rules pending.
+with `- before:` / `+ after:` / `+ added:` member lists. Post-update menu:
+**commit (with optional description)**, **revert these rule changes**
+(restores the original member lists per rule, writes its own
+`where-used_<query>_rule-revert_<ts>.txt` diff), or **leave pending**.
+
+Note: on builds where the modern REST API does not expose rule resources
+(`HTTP 501 Route Not Found` on `/Rules/...`) and the XML API refuses `set`
+(code 16), rule edits cannot be applied - run `--diagnose` to see which
+rule-related REST routes the box actually supports.
 
 Note: object resolution is by name across all device groups and shared;
 cross-device-group scoping nuances (e.g. a group with the same name in two

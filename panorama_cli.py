@@ -56,7 +56,7 @@ OBJECT_TYPES = [
 ]
 # Order in which object types are applied so references resolve (groups
 # reference addresses/services, objects reference tags).
-BUILD = "2026-11-13i (field label in before/after; /Rules/<Type> endpoint probe)"
+BUILD = "2026-11-13j (rule edit: revert option, rule-revert diff, field labels)"
 APPLY_ORDER = ["tag", "application", "service", "service-group", "address",
                "address-group"]
 DG_GROUPS = ("DevGroup", "DynGroup")  # static and dynamic device groups
@@ -652,6 +652,8 @@ class PanoramaClient:
             bases.append(alt)
         for base in bases:
             for endpoint in (f"/Rules/{type_seg}",
+                             f"/{type_seg}Rules",
+                             f"/Objects/{type_seg}Rules",
                              f"/Objects/Rules/{type_seg}",
                              "/Rules"):
                 for method in ("POST", "PUT"):
@@ -1766,7 +1768,8 @@ def _add_to_rules(client: PanoramaClient, objects: dict, records: list,
                 continue
             base = dict(cur) if isinstance(cur, dict) else {}
             base.pop("member", None)
-            plan.append((rec, fld, members,
+            orig_val = {**base, "member": list(members)}
+            plan.append((rec, fld, members, orig_val,
                          {**base, "member": list(members) + to_add}, to_add))
     if skipped:
         print("\n  Skipped:")
@@ -1778,7 +1781,7 @@ def _add_to_rules(client: PanoramaClient, objects: dict, records: list,
         return
 
     print(f"\nWill update {len(plan)} rule field(s):")
-    for rec, fld, members, new_val, _to_add in plan:
+    for rec, fld, members, _orig, new_val, _to_add in plan:
         print(f"  [{rec['_rb']}] {rec['location']}/{rec['rule']}")
         print(f"    before: {fld}: {' | '.join(members)}")
         print(f"    after : {fld}: {' | '.join(member_values(new_val))}")
@@ -1786,70 +1789,107 @@ def _add_to_rules(client: PanoramaClient, objects: dict, records: list,
         print("Rule update cancelled.")
         return
 
-    def _rule_diff(phase: str, statuses: list[tuple[str, str]]) \
-            -> tuple[str, str]:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = safe_filename("where-used",
-                             f"{query}_rule-edit_{ts}", "txt")
-        header = (f"Panorama rule member diff\n"
-                  f"Query       : {query}\n"
-                  f"Adding      : {', '.join(adds)}\n"
-                  f"Phase       : {phase}\n"
-                  f"Generated   : "
-                  f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                  f"(source/destination member lists before -> after)\n"
-                  + "=" * 60 + "\n\n")
-        body = []
-        for (rec, fld, members, new_val, to_add), (status, err) in \
-                zip(plan, statuses):
-            body.append(f"[{status}] [{rec['_rb']}] "
-                        f"{rec['location']}/{rec['rule']}")
-            body.append(f"  - before: {fld}: {' | '.join(members)}")
-            body.append(f"  + after : {fld}: "
-                        f"{' | '.join(member_values(new_val))}")
-            body.append(f"  + added : {fld}: {', '.join(to_add)}")
-            if err:
-                body.append(f"  ! {err}")
-            body.append("")
-        return path, header + "\n".join(body)
-
     ok, failed, statuses = 0, [], []
-    for rec, fld, members, new_val, _to_add in plan:
-        loc, rb, rname = rec["location"], rec["_rb"], rec["rule"]
-        err = ""
-        done = False
-        element = xml_value(fld, new_val)
-        for path in rule_field_paths(loc, rb, rname, fld):
-            try:
-                client.config_set(path, element)
-                done = True
-                break
-            except RuntimeError as exc:
-                err = str(exc)
-        last_err = err
-        if not done:
-            full_rule = {k: v for k, v in rec["_rule"].items()
-                         if k != "name"}
-            full_rule[fld] = new_val
-            try:
-                client.rest_rule_update(loc, rb, rname, full_rule)
-                done = True
-            except RuntimeError as exc:
-                last_err = f"XML: {err}; REST rules: {exc}"
-                failed.append((f"{loc}/{rname} ({fld})", last_err))
-                statuses.append(("FAILED", last_err))
-                continue
-        statuses.append(("UPDATED", ""))
-        ok += 1
+    for rec, fld, _members, _orig, new_val, _to_add in plan:
+        good, err = _write_rule_field(client, rec, fld, new_val)
+        if good:
+            statuses.append(("UPDATED", ""))
+            ok += 1
+        else:
+            statuses.append(("FAILED", err))
+            failed.append((f"{rec['location']}/{rec['rule']} ({fld})", err))
     print(f"\nUpdated {ok}/{len(plan)} rule field(s).")
     for name, err in failed[:5]:
         print(f"  FAILED {name}: {err}", file=sys.stderr)
 
-    diff_path, diff_text = _rule_diff("applied", statuses)
+    diff_entries = [(rec, fld, members, new_val, to_add)
+                    for rec, fld, members, _o, new_val, to_add in plan]
+    diff_path, diff_text = _rule_edit_diff(query, adds, diff_entries,
+                                           statuses, "applied", "rule-edit")
+    _move_print_diff(diff_text, diff_path)
+    if ok:
+        actions = ["commit changes (optional description)",
+                   "revert these rule changes", "leave pending"]
+        action = choose(actions, "Post-update")
+        if action == actions[0]:
+            commit_changes(client)
+        elif action == actions[1]:
+            _revert_rule_changes(client, query, plan, statuses)
+
+
+def _write_rule_field(client: PanoramaClient, rec: dict, fld: str,
+                      new_val) -> tuple[bool, str]:
+    """Set one rule field (XML API paths first, REST rules endpoint after)."""
+    loc, rb, rname = rec["location"], rec["_rb"], rec["rule"]
+    err = ""
+    element = xml_value(fld, new_val)
+    for path in rule_field_paths(loc, rb, rname, fld):
+        try:
+            client.config_set(path, element)
+            return True, ""
+        except RuntimeError as exc:
+            err = str(exc)
+    full_rule = {k: v for k, v in rec["_rule"].items() if k != "name"}
+    full_rule[fld] = new_val
+    try:
+        client.rest_rule_update(loc, rb, rname, full_rule)
+        return True, ""
+    except RuntimeError as exc:
+        return False, f"XML: {err}; REST rules: {exc}"
+
+
+def _rule_edit_diff(query: str, adds: list[str], entries: list[tuple],
+                    statuses: list[tuple[str, str]], phase: str,
+                    suffix: str) -> tuple[str, str]:
+    """entries: (rec, field, before_members, after_value, added_list)."""
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = safe_filename("where-used", f"{query}_{suffix}_{ts}", "txt")
+    header = (f"Panorama rule member diff\n"
+              f"Query       : {query}\n"
+              f"Adding      : {', '.join(adds) if adds else '-'}\n"
+              f"Phase       : {phase}\n"
+              f"Generated   : "
+              f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+              f"(source/destination member lists before -> after)\n"
+              + "=" * 60 + "\n\n")
+    body = []
+    for (rec, fld, before, after_val, to_add), (status, err) in \
+            zip(entries, statuses):
+        body.append(f"[{status}] [{rec['_rb']}] "
+                    f"{rec['location']}/{rec['rule']}")
+        body.append(f"  - before: {fld}: {' | '.join(before)}")
+        body.append(f"  + after : {fld}: "
+                    f"{' | '.join(member_values(after_val))}")
+        if to_add:
+            body.append(f"  + added : {fld}: {', '.join(to_add)}")
+        if err:
+            body.append(f"  ! {err}")
+        body.append("")
+    return path, header + "\n".join(body)
+
+
+def _revert_rule_changes(client: PanoramaClient, query: str,
+                         plan: list, statuses: list) -> None:
+    """Restore original member lists for the rule fields that were updated."""
+    entries = [(rec, fld, member_values(new_val), orig_val, [])
+               for (rec, fld, _m, orig_val, new_val, _t), (st, _e)
+               in zip(plan, statuses) if st == "UPDATED"]
+    if not entries:
+        print("Nothing to revert (no rule changes applied).")
+        return
+    ok, rstatus = 0, []
+    for rec, fld, _before, orig_val, _add in entries:
+        good, err = _write_rule_field(client, rec, fld, orig_val)
+        rstatus.append(("REVERTED", "") if good else ("FAILED", err))
+        ok += 1 if good else 0
+    print(f"\nReverted {ok}/{len(entries)} rule field(s) to their original "
+          "members.")
+    diff_path, diff_text = _rule_edit_diff(query, [], entries, rstatus,
+                                           "reverted", "rule-revert")
     _move_print_diff(diff_text, diff_path)
     if ok:
         actions = ["commit changes (optional description)", "leave pending"]
-        if choose(actions, "Post-update") == actions[0]:
+        if choose(actions, "Post-revert") == actions[0]:
             commit_changes(client)
 
 
@@ -1916,6 +1956,14 @@ def run_diagnostics(client: PanoramaClient) -> None:
         ("modern REST v11: address objects in shared",
          {"location": "shared", "limit": "3"},
          "/restapi/v11.0/Objects/Addresses"),
+        ("modern REST v11: security rules probe (rule routes?)",
+         {"location": "shared", "rulebase": "rulebase", "limit": "1"},
+         "/restapi/v11.0/Rules/Security"),
+        ("modern REST v11: SecurityRules resource probe",
+         {"location": "shared", "limit": "1"},
+         "/restapi/v11.0/SecurityRules"),
+        ("modern REST v11: resource index (GET /restapi/v11.0)",
+         {}, "/restapi/v11.0"),
         ("REST API docs index",
          {}, "/restapi-doc/"),
     ]
