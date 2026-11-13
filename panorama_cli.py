@@ -56,7 +56,7 @@ OBJECT_TYPES = [
 ]
 # Order in which object types are applied so references resolve (groups
 # reference addresses/services, objects reference tags).
-BUILD = "2026-11-13k (rule write: op load/partial attempt, CLI script fallback)"
+BUILD = "2026-11-13l (rule write: op load/partial candidates with <devices> mirror)"
 APPLY_ORDER = ["tag", "application", "service", "service-group", "address",
                "address-group"]
 DG_GROUPS = ("DevGroup", "DynGroup")  # static and dynamic device groups
@@ -283,25 +283,39 @@ class PanoramaClient:
     def config_delete(self, path: str):
         return self.config_write("delete", path)
 
-    def op_partial_config_load(self, subtree_xml: str):
+    def op_partial_config_load(self, subtree_xml: str | list[str]):
         """Write a config subtree through the op API's load/partial command.
 
         type=op works even when type=config set is refused (code 16), and
-        partial-load is the classic route for Panorama rule bulk changes."""
-        cmd = f"<load><config><partial>{subtree_xml}</partial></config></load>"
+        partial-load is the classic route for Panorama rule bulk changes.
+        Accepts one subtree or a list of candidate roots to try in order."""
+        if isinstance(subtree_xml, str):
+            subtree_xml = [subtree_xml]
         data = {"key": self.api_key, "api-version": API_VERSION,
-                "type": "op", "cmd": cmd}
+                "type": "op"}
         url = f"https://{self.host}/api/{API_VERSION}"
-        try:
-            return self._handle_response(
-                self.session.post(url, data=data, timeout=self.timeout,
-                                  verify=False), url, data)
-        except RuntimeError as exc:
-            if "code 16" not in str(exc):
-                raise
-            return self._handle_response(
-                self.session.get(url, params=data, timeout=self.timeout,
-                                 verify=False), url, data)
+        errs: list[str] = []
+        for sub in subtree_xml:
+            data["cmd"] = (f"<load><config><partial>{sub}"
+                           f"</partial></config></load>")
+            try:
+                self._handle_response(
+                    self.session.post(url, data=data, timeout=self.timeout,
+                                      verify=False), url, data)
+                return
+            except RuntimeError as exc:
+                if "code 16" not in str(exc):
+                    errs.append(str(exc))
+                    continue
+                try:
+                    self._handle_response(
+                        self.session.get(url, params=data,
+                                         timeout=self.timeout, verify=False),
+                        url, data)
+                    return
+                except RuntimeError as exc2:
+                    errs.append(str(exc2))
+        raise RuntimeError("; ".join(errs))
 
     # ---------------- Modern REST API (panui_restapi) ------------------- #
     def _rest(self, method: str, path: str, params: dict | None = None,
@@ -1844,8 +1858,10 @@ def _add_to_rules(client: PanoramaClient, objects: dict, records: list,
             _revert_rule_changes(client, query, plan, statuses)
 
 
-def _partial_rule_subtree(rec: dict, fld: str, new_val) -> str:
-    """Build a load/config/partial subtree that replaces one rule field."""
+def _partial_rule_subtree(rec: dict, fld: str, new_val) -> list[str]:
+    """Candidate load/config/partial subtrees for one rule field, ordered
+    by most likely accepted root: full <devices> mirror first (the
+    serialized config tree), then bare container roots."""
     def q(v):
         return escape(str(v), {'"': "&quot;"})
     body = xml_value(fld, new_val)
@@ -1855,10 +1871,13 @@ def _partial_rule_subtree(rec: dict, fld: str, new_val) -> str:
         xml = f"<{seg}>{xml}</{seg}>"
     xml = f"<rules>{xml}</rules>"
     if rec["location"] == SHARED_LABEL:
-        return f"<shared>{xml}</shared>"
-    return (f"<device-group><entry "
-            f"name=\"{q(rec['location'])}\">{xml}</entry>"
-            f"</device-group>")
+        return [f"<shared>{xml}</shared>",
+                f"<devices><entry name=\"LocalDevice\"><shared>{xml}"
+                f"</shared></entry></devices>"]
+    dg = (f"<device-group><entry name=\"{q(rec['location'])}\">{xml}"
+          f"</entry></device-group>")
+    return [f"<devices><entry name=\"LocalDevice\">{dg}</entry></devices>",
+            dg]
 
 
 def _rule_cli_script(query: str, plan: list,
