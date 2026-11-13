@@ -56,7 +56,7 @@ OBJECT_TYPES = [
 ]
 # Order in which object types are applied so references resolve (groups
 # reference addresses/services, objects reference tags).
-BUILD = "2026-11-13c (convert-more re-picks object type)"
+BUILD = "2026-11-13d (merged where-used into main menu flow)"
 APPLY_ORDER = ["tag", "application", "service", "service-group", "address",
                "address-group"]
 DG_GROUPS = ("DevGroup", "DynGroup")  # static and dynamic device groups
@@ -1448,7 +1448,7 @@ def where_used(client: PanoramaClient) -> None:
         query = input("Search object by name, IP address or group name "
                       "('q' to quit): ").strip().strip('"')
         if query.lower() in ("q", "quit"):
-            raise SystemExit("bye")
+            return
         if not query:
             continue
         _where_used_once(client, locations, objects, group_map, query)
@@ -2011,28 +2011,43 @@ def main() -> None:
         run_diagnostics(client)
         return
 
-    # 2. Fetch running config, then pick a mode.
+    # 2. Fetch running config, then pick a mode; re-offer the menu after each.
     print("Fetching running config ...")
     client.running_config()
-    if args.output == "text":
-        modes = ["explore device-group objects (browse/export/import/copy)",
-                 "find where an object is used (rule search)"]
-        mode = choose(modes, "Mode")
+    modes = ["explore device-group objects (browse/export/import/copy)",
+             "find where an object is used (rule search)",
+             "quit"]
+    while True:
+        if args.output == "text":
+            mode = choose(modes, "Mode")
+        else:
+            mode = modes[0]
+        if mode == "quit":
+            print("bye")
+            return
         if mode.startswith("find "):
             where_used(client)
+        else:
+            explore_objects(client, args)
+        if args.output != "text":
             return
+
+
+def explore_objects(client: PanoramaClient, args) -> None:
+    """Device-group browser: list/export/import/copy-move object(s)."""
     groups = list_device_groups(client)
     if isinstance(client.running_config().get("shared"), dict):
         groups.insert(0, SHARED_LABEL)
     device_group = choose(groups, "Device groups")
     print(f"Selected device group: {device_group}")
 
-    # 3. Action: list, export, import, or move objects to shared. Re-offer the
+    # Action: list, export, import, or move objects to shared. Re-offer the
     # menu after each action so multiple actions can be run per session.
-    actions = ["list objects", "export to CSV/JSON", "import from CSV/JSON file"]
+    actions = ["list objects", "export to CSV/JSON",
+               "import from CSV/JSON file"]
     if device_group != SHARED_LABEL:
         actions.append("copy/move object(s) to shared")
-    actions.append("quit")
+    actions.append("back to mode menu")
 
     while True:
         if args.output == "text":
@@ -2040,8 +2055,7 @@ def main() -> None:
         else:
             action = actions[1]
 
-        if action == "quit":
-            print("bye")
+        if action == actions[-1]:
             return
 
         if action == actions[2]:
@@ -2050,7 +2064,6 @@ def main() -> None:
                 return
             continue
 
-        # 4. Object type.
         obj_type = choose(OBJECT_TYPES, "Object types")
 
         if action.startswith("copy/"):
