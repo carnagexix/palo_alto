@@ -56,7 +56,7 @@ OBJECT_TYPES = [
 ]
 # Order in which object types are applied so references resolve (groups
 # reference addresses/services, objects reference tags).
-BUILD = "2026-11-13h (rule edit: target found field, before/after diff, commit desc)"
+BUILD = "2026-11-13i (field label in before/after; /Rules/<Type> endpoint probe)"
 APPLY_ORDER = ["tag", "application", "service", "service-group", "address",
                "address-group"]
 DG_GROUPS = ("DevGroup", "DynGroup")  # static and dynamic device groups
@@ -620,28 +620,50 @@ class PanoramaClient:
     def rest_rule_update(self, device_group: str, rulebase: str,
                          rule_name: str, rule: dict) -> dict:
         """Update one rule via the modern REST API, probing the endpoint and
-        method this build exposes (/Rules vs /Objects/Rules, POST vs PUT).
+        method this build exposes, then caching the working route.
 
         rulebase is e.g. 'rulebase/security' or 'pre-rulebase/nat'; the rule
-        dict is the full (merged) rule body read from the running config."""
+        dict is the full (merged) rule body read from the running config.
+        The per-type resources (/Rules/Security, /Rules/Nat, ...) are the
+        documented 11.x routes; plain /Rules is tried as a fallback."""
         kind = rulebase.split("/")[0]
-        base = self.rest_base()
+        rtype = rulebase.split("/")[-1] if "/" in rulebase else "security"
+        type_seg = {"security": "Security", "nat": "Nat", "pbr": "Pbr",
+                    "dos": "Dos"}.get(rtype.lower(), rtype.capitalize())
         loc = self._rest_location(device_group)
+        params = {**loc, "rulebase": kind, "name": rule_name}
+        if device_group != SHARED_LABEL:
+            params["panorama"] = "LocalDevice"
         entry = {k: v for k, v in rule.items() if k != "name"}
         entry["@name"] = rule_name
         entry["@rulebase"] = kind
         body = {"entry": [entry]}
+        cached = getattr(self, "_rules_route", None)
+        if isinstance(cached, tuple):
+            path, method = cached
+            return self._rest(method, path, params, body)
+        if cached is False:
+            raise RuntimeError(getattr(self, "_rules_err",
+                                       "no supported REST rules endpoint"))
         last: RuntimeError | None = None
-        for endpoint in ("/Rules", "/Objects/Rules"):
-            for method in ("POST", "PUT"):
-                params = {**loc, "rulebase": kind, "name": rule_name}
-                if device_group != SHARED_LABEL:
-                    params["panorama"] = "LocalDevice"
-                try:
-                    return self._rest(method, f"{base}{endpoint}", params,
-                                      body)
-                except RuntimeError as exc:
-                    last = exc
+        bases = [self.rest_base()]
+        alt = bases[0].replace("/v11.", "/v12.")
+        if alt != bases[0]:
+            bases.append(alt)
+        for base in bases:
+            for endpoint in (f"/Rules/{type_seg}",
+                             f"/Objects/Rules/{type_seg}",
+                             "/Rules"):
+                for method in ("POST", "PUT"):
+                    try:
+                        data = self._rest(method, f"{base}{endpoint}",
+                                          params, body)
+                        self._rules_route = (f"{base}{endpoint}", method)
+                        return data
+                    except RuntimeError as exc:
+                        last = exc
+        self._rules_route = False
+        self._rules_err = str(last or "no REST rules endpoint")
         raise last  # type: ignore[misc]
 
     def rest_commit(self, description: str) -> dict:
@@ -1757,9 +1779,9 @@ def _add_to_rules(client: PanoramaClient, objects: dict, records: list,
 
     print(f"\nWill update {len(plan)} rule field(s):")
     for rec, fld, members, new_val, _to_add in plan:
-        print(f"  [{rec['_rb']}] {rec['location']}/{rec['rule']} {fld}")
-        print(f"    before: {' | '.join(members)}")
-        print(f"    after : {' | '.join(member_values(new_val))}")
+        print(f"  [{rec['_rb']}] {rec['location']}/{rec['rule']}")
+        print(f"    before: {fld}: {' | '.join(members)}")
+        print(f"    after : {fld}: {' | '.join(member_values(new_val))}")
     if input("Type 'yes' to update these rules: ").strip().lower() != "yes":
         print("Rule update cancelled.")
         return
@@ -1781,14 +1803,13 @@ def _add_to_rules(client: PanoramaClient, objects: dict, records: list,
         for (rec, fld, members, new_val, to_add), (status, err) in \
                 zip(plan, statuses):
             body.append(f"[{status}] [{rec['_rb']}] "
-                        f"{rec['location']}/{rec['rule']}  {fld}")
+                        f"{rec['location']}/{rec['rule']}")
+            body.append(f"  - before: {fld}: {' | '.join(members)}")
+            body.append(f"  + after : {fld}: "
+                        f"{' | '.join(member_values(new_val))}")
+            body.append(f"  + added : {fld}: {', '.join(to_add)}")
             if err:
                 body.append(f"  ! {err}")
-            body.append(f"  - before: {' | '.join(members)}")
-            if status == "UPDATED":
-                body.append(f"  + after : "
-                            f"{' | '.join(member_values(new_val))}")
-                body.append("  + added : " + ", ".join(to_add))
             body.append("")
         return path, header + "\n".join(body)
 
