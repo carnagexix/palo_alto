@@ -1327,6 +1327,238 @@ def print_objects(client: PanoramaClient, device_group: str, obj_type: str,
 
 
 # --------------------------------------------------------------------------- #
+# Where-used: find rules (security/NAT/PBR) referencing an object or IP
+# --------------------------------------------------------------------------- #
+RULE_DETAIL_KEYS = ("from", "to", "source", "source-hip", "destination",
+                    "destination-hip", "service", "application", "action",
+                    "negated", "disabled", "description")
+IP_FIELDS = ("ip-netmask", "ip-range", "ip-wildcard")
+
+
+def iter_rules(container):
+    """Yield (rule entry, rulebase path) for every rule under container.
+
+    Handles rulebase / pre-rulebase / post-rulebase and security/nat/pbr
+    sections without hardcoding any single layout."""
+    stack = [(container, [])]
+    seen = set()
+    while stack:
+        node, path = stack.pop()
+        if isinstance(node, dict):
+            if id(node) in seen:
+                continue
+            seen.add(id(node))
+            for key, value in node.items():
+                if key == "rules" and isinstance(value, (dict, list)):
+                    rb = "/".join(path) if path else "?"
+                    for rule in as_entry_list(value):
+                        yield rule, rb
+                elif isinstance(value, (dict, list)):
+                    stack.append((value, path + [key]))
+        elif isinstance(node, list):
+            for value in node:
+                if isinstance(value, (dict, list)):
+                    stack.append((value, path))
+
+
+def member_values(value) -> list[str]:
+    """Extract member names from a rule field (plain, <member> form or list)."""
+    out: list[str] = []
+    if isinstance(value, dict):
+        mem = value.get("member")
+        if isinstance(mem, list):
+            out.extend(str(m) for m in mem if isinstance(m, (str, int, float)))
+        elif isinstance(mem, (str, int, float)):
+            out.append(str(mem))
+    elif isinstance(value, list):
+        out.extend(str(v) for v in value if isinstance(v, (str, int, float)))
+    return out
+
+
+def build_object_index(client: PanoramaClient, locations: list[str]):
+    """Index every object across all locations.
+
+    Returns (objects, groups): lower-name -> object dict, and lower-name ->
+    set of lower-case member names for group objects."""
+    objects: dict[str, dict] = {}
+    groups: dict[str, set] = {}
+    for loc in locations:
+        container = find_device_group(client, loc)
+        if not isinstance(container, dict):
+            continue
+        for obj_type in OBJECT_TYPES:
+            for entry in as_entry_list(dig(container, obj_type)):
+                name = entry.get("name")
+                if not name:
+                    continue
+                key = str(name).lower()
+                objects.setdefault(key, {"name": str(name), "type": obj_type,
+                                         "location": loc, "fields": entry})
+                if obj_type.endswith("group"):
+                    groups.setdefault(key, set()).update(
+                        m.lower() for m in member_values(entry.get("member")))
+    return objects, groups
+
+
+def _object_matches(obj: dict, query_lower: str) -> bool:
+    if query_lower in str(obj["name"]).lower():
+        return True
+    for key in IP_FIELDS:
+        value = obj["fields"].get(key)
+        if isinstance(value, str) and query_lower in value.lower():
+            return True
+    return False
+
+
+def expand_group_hits(direct: set, groups: dict) -> tuple[set, dict]:
+    """Grow the hit set with groups (transitively) containing a hit."""
+    def members_under(gname: str, seen: set) -> set:
+        res = set()
+        for m in groups.get(gname, ()):
+            if m in seen:
+                continue
+            res.add(m)
+            if m in groups:
+                res |= members_under(m, seen | {m})
+        return res
+
+    via: dict[str, list[str]] = {}
+    current = set(direct)
+    changed = True
+    while changed:
+        changed = False
+        for gname, members in groups.items():
+            if gname in current:
+                continue
+            if members & current:
+                current.add(gname)
+                via[gname] = sorted(members_under(gname, {gname}) & direct)
+                changed = True
+    return current, via
+
+
+def where_used(client: PanoramaClient) -> None:
+    locations = [SHARED_LABEL] + list_device_groups(client)
+    objects, group_map = build_object_index(client, locations)
+    if not objects:
+        print("No objects found across shared/device groups - nothing to "
+              "search.")
+        return
+    while True:
+        query = input("Search object by name, IP address or group name "
+                      "('q' to quit): ").strip().strip('"')
+        if query.lower() in ("q", "quit"):
+            raise SystemExit("bye")
+        if not query:
+            continue
+        _where_used_once(client, locations, objects, group_map, query)
+
+
+def _where_used_once(client: PanoramaClient, locations: list[str],
+                     objects: dict, group_map: dict, query: str) -> None:
+    ql = query.lower()
+    direct = {name for name, obj in objects.items() if _object_matches(obj, ql)}
+    hits, via = expand_group_hits(direct, group_map)
+    if not direct:
+        print(f"No address/service/application/tag object matches '{query}'.")
+        return
+
+    records = []
+    for loc in locations:
+        container = find_device_group(client, loc)
+        if not isinstance(container, dict):
+            continue
+        for rule, rb in iter_rules(container):
+            matched: dict[str, list[str]] = {}
+            for field, value in rule.items():
+                if field == "name":
+                    continue
+                for member in member_values(value):
+                    if member.lower() in hits:
+                        matched.setdefault(field, []).append(member)
+            if not matched:
+                continue
+            rec = {"location": loc, "rulebase": rb,
+                   "rule": str(rule.get("name", ""))}
+            for field in RULE_DETAIL_KEYS:
+                if field in rule:
+                    rec[field] = fmt_value(rule[field])
+            matched_objs, via_notes = [], []
+            seen_members: set[str] = set()
+            for field, ms in matched.items():
+                for m in ms:
+                    ml = m.lower()
+                    if ml in seen_members:
+                        continue
+                    seen_members.add(ml)
+                    matched_objs.append(m)
+                    if ml in via:
+                        via_notes.append(
+                            f"{m} (contains {'/'.join(via[ml])})")
+            rec["used_in"] = "; ".join(
+                f"{f}: {'|'.join(ms)}" for f, ms in matched.items())
+            rec["matched_objects"] = ", ".join(dict.fromkeys(matched_objs))
+            rec["indirectly_via"] = "; ".join(dict.fromkeys(via_notes))
+            records.append(rec)
+
+    print(f"\nQuery '{query}': {len(direct)} matching object(s), "
+          f"{len(records)} rule reference(s).")
+    if not records:
+        print("No rules reference this object, or any group that contains it.")
+        return
+
+    fmt = choose(["text", "csv", "json"], "Output format")
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ext = "txt" if fmt == "text" else fmt
+    path = safe_filename("where-used", f"{query}_{ts}", ext)
+
+    text_lines: list[str] = []
+    current_loc = None
+    for rec in records:
+        if rec["location"] != current_loc:
+            current_loc = rec["location"]
+            text_lines.append(f"\n=== {current_loc} ===")
+        flag = (" [disabled]"
+                if str(rec.get("disabled", "")).lower() == "yes" else "")
+        text_lines.append(f"  [{rec['rulebase']}] {rec['rule']}{flag}")
+        text_lines.append(f"      used in: {rec['used_in']}")
+        text_lines.append(f"      objects: {rec['matched_objects']}")
+        if rec["indirectly_via"]:
+            text_lines.append(f"      indirectly: {rec['indirectly_via']}")
+        for key in ("from", "to", "source", "destination", "service",
+                    "application", "action", "negated", "description"):
+            if rec.get(key):
+                text_lines.append(f"      {key}: {rec[key]}")
+
+    if fmt == "text":
+        print("\n".join(text_lines))
+        Path(path).write_text("\n".join(text_lines), encoding="utf-8")
+        print(f"\nSaved to {path}")
+    elif fmt == "json":
+        payload = {"query": query,
+                   "generated": datetime.now().isoformat(timespec="seconds"),
+                   "object_matches": sorted(objects[n]["name"]
+                                            for n in direct),
+                   "rule_references": records}
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2, ensure_ascii=False)
+        print(f"Wrote {len(records)} rule reference(s) to {path}")
+    else:
+        keys = (["location", "rulebase", "rule", "used_in",
+                 "matched_objects", "indirectly_via"] +
+                [k for k in RULE_DETAIL_KEYS
+                 if k not in ("source", "destination", "service",
+                              "application")])
+        keys = list(dict.fromkeys(keys))
+        with open(path, "w", encoding="utf-8", newline="") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(keys)
+            for rec in records:
+                writer.writerow([rec.get(key, "") for key in keys])
+        print(f"Wrote {len(records)} rule reference(s) to {path}")
+
+
+# --------------------------------------------------------------------------- #
 # Diagnostics
 # --------------------------------------------------------------------------- #
 def print_diagnostics(client: PanoramaClient) -> None:
@@ -1779,8 +2011,16 @@ def main() -> None:
         run_diagnostics(client)
         return
 
-    # 2. Fetch running config -> list device groups -> select one.
+    # 2. Fetch running config, then pick a mode.
     print("Fetching running config ...")
+    client.running_config()
+    if args.output == "text":
+        modes = ["explore device-group objects (browse/export/import/copy)",
+                 "find where an object is used (rule search)"]
+        mode = choose(modes, "Mode")
+        if mode.startswith("find "):
+            where_used(client)
+            return
     groups = list_device_groups(client)
     if isinstance(client.running_config().get("shared"), dict):
         groups.insert(0, SHARED_LABEL)
