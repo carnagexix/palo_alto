@@ -56,7 +56,7 @@ OBJECT_TYPES = [
 ]
 # Order in which object types are applied so references resolve (groups
 # reference addresses/services, objects reference tags).
-BUILD = "2026-11-13l (rule write: op load/partial candidates with <devices> mirror)"
+BUILD = "2026-11-13m (rule search: report address/service/app groups that use the object)"
 APPLY_ORDER = ["tag", "application", "service", "service-group", "address",
                "address-group"]
 DG_GROUPS = ("DevGroup", "DynGroup")  # static and dynamic device groups
@@ -1611,6 +1611,22 @@ def _where_used_once(client: PanoramaClient, locations: list[str],
         print(f"No address/service/application/tag object matches '{query}'.")
         return
 
+    def group_rows() -> list[dict]:
+        rows = []
+        for gl in sorted(via):
+            obj = objects.get(gl) or {"name": gl, "type": "?",
+                                      "location": "?"}
+            hit_members = sorted(m for m in group_map.get(gl, ())
+                                 if m in direct or m in via)
+            rows.append({"name": obj["name"], "type": obj["type"],
+                         "location": obj["location"],
+                         "contains": ", ".join(
+                             objects[m]["name"] if m in objects else m
+                             for m in hit_members)})
+        return rows
+
+    grows = group_rows()
+
     records = []
     for loc in locations:
         container = find_device_group(client, loc)
@@ -1653,13 +1669,20 @@ def _where_used_once(client: PanoramaClient, locations: list[str],
             records.append(rec)
 
     print(f"\nQuery '{query}': {len(direct)} matching object(s), "
-          f"{len(records)} rule reference(s).")
+          f"{len(grows)} group reference(s), {len(records)} rule "
+          f"reference(s).")
     print(f"\nMatched object(s) for '{query}':")
     for n in sorted(direct):
         obj = objects[n]
         summary = _obj_summary(obj["fields"])
         print(f"  {obj['name']} ({obj['type']}, {obj['location']})"
               + (f"  [{summary}]" if summary else ""))
+
+    if grows:
+        print(f"\nUsed in group(s) for '{query}':")
+        for r in grows:
+            print(f"  {r['name']} ({r['type']}, {r['location']})"
+                  f"  [contains: {r['contains']}]")
 
     if records:
         print()
@@ -1719,12 +1742,24 @@ def _where_used_once(client: PanoramaClient, locations: list[str],
                     writer.writerow([rec.get(key, "") for key in keys])
             print(f"Wrote {len(export_records)} rule reference(s) to "
                   f"{rule_path}")
+            if grows:
+                grp_path = safe_filename("where-used",
+                                         f"{query}_groups_{ts}", "csv")
+                with open(grp_path, "w", encoding="utf-8",
+                          newline="") as fh:
+                    writer = csv.writer(fh)
+                    writer.writerow(["name", "type", "location", "contains"])
+                    for row in grows:
+                        writer.writerow([row["name"], row["type"],
+                                         row["location"], row["contains"]])
+                print(f"Wrote {len(grows)} group reference(s) to {grp_path}")
         else:
             path = safe_filename("where-used", f"{query}_{ts}", "json")
             payload = {"query": query,
                        "generated": datetime.now().isoformat(
                            timespec="seconds"),
                        "object_matches": obj_rows,
+                       "group_references": grows,
                        "rule_references": export_records}
             with open(path, "w", encoding="utf-8") as fh:
                 json.dump(payload, fh, indent=2, ensure_ascii=False)

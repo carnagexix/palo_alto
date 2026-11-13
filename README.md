@@ -153,6 +153,9 @@ the **committed** running config across **all device groups and shared**:
   (`ip-netmask` / `ip-range` / `ip-wildcard` contains the query);
 - resolves address groups and address groups in rules (transitively) so a
   rule using `grp-servers` counts as using a member address object;
+- lists every group (address-group, service-group, application-group) that
+  **uses the object** (directly or via a nested group), with the members it
+  contains;
 - scans every security, NAT and PBR rulebase (pre-/post-rulebase included)
   in each device group;
 - always lists every matched **object name** with its type and location
@@ -163,10 +166,11 @@ the **committed** running config across **all device groups and shared**:
 
 After each search, enter another query to keep searching (`q` returns to the
 Mode menu). At the `Export results` prompt: `c` writes
-`where-used_<query>_<ts>_objects.csv` (matched objects) plus
-`where-used_<query>_<ts>_rules.csv` (rule references); `j` writes a single
-`where-used_<query>_<ts>.json` containing both. Enter skips export (results
-are always printed to the screen).
+`where-used_<query>_<ts>_objects.csv` (matched objects),
+`where-used_<query>_<ts>_rules.csv` (rule references) and
+`where-used_<query>_<ts>_groups.csv` (groups that use the object); `j` writes
+a single `where-used_<query>_<ts>.json` containing all three. Enter skips
+export (results are always printed to the screen).
 
 When rules were found, an extra prompt offers **adding address /
 address-group objects to those rules**: enter names comma-separated, or
@@ -184,9 +188,13 @@ with `- before:` / `+ after:` / `+ added:` member lists. Post-update menu:
 `where-used_<query>_rule-revert_<ts>.txt` diff), or **leave pending**.
 
 Note: on builds where the modern REST API does not expose rule resources
-(`HTTP 501 Route Not Found` on `/Rules/...`) and the XML API refuses `set`
-(code 16), rule edits cannot be applied - run `--diagnose` to see which
-rule-related REST routes the box actually supports.
+(`HTTP 501 Route Not Found` on `/Rules/...`), the XML API refuses `set`
+(code 16) **and** `type=op` `load/config/partial` is refused (code 17 on
+every subtree root), rule edits cannot be applied through the API at all -
+the tool then auto-generates a **CLI fallback script**
+(`where-used_<query>_rule-edit-cli_<ts>.txt`) with paste-ready `clear`/`set`
+lines for the Panorama CLI, and skips remaining attempts. Run `--diagnose`
+to see which rule-related routes the box actually supports.
 
 Note: object resolution is by name across all device groups and shared;
 cross-device-group scoping nuances (e.g. a group with the same name in two
