@@ -56,7 +56,7 @@ OBJECT_TYPES = [
 ]
 # Order in which object types are applied so references resolve (groups
 # reference addresses/services, objects reference tags).
-BUILD = "2026-11-13m (rule search: report address/service/app groups that use the object)"
+BUILD = "2026-11-13n (fix: index address-group members under <static> for group usage search)"
 APPLY_ORDER = ["tag", "application", "service", "service-group", "address",
                "address-group"]
 DG_GROUPS = ("DevGroup", "DynGroup")  # static and dynamic device groups
@@ -1534,7 +1534,7 @@ def build_object_index(client: PanoramaClient, locations: list[str]):
         container = find_device_group(client, loc)
         if not isinstance(container, dict):
             continue
-        for obj_type in OBJECT_TYPES:
+        for obj_type in OBJECT_TYPES + ["application-group"]:
             for entry in as_entry_list(dig(container, obj_type)):
                 name = entry.get("name")
                 if not name:
@@ -1543,8 +1543,15 @@ def build_object_index(client: PanoramaClient, locations: list[str]):
                 objects.setdefault(key, {"name": str(name), "type": obj_type,
                                          "location": loc, "fields": entry})
                 if obj_type.endswith("group"):
+                    # XML API nests address-group members under <static>,
+                    # service/app groups use a direct <member> list.
+                    mem = entry.get("member")
+                    if mem is None:
+                        stat = entry.get("static")
+                        mem = stat.get("member") if isinstance(stat, dict) \
+                            else stat
                     groups.setdefault(key, set()).update(
-                        m.lower() for m in member_values(entry.get("member")))
+                        m.lower() for m in member_values(mem))
     return objects, groups
 
 
