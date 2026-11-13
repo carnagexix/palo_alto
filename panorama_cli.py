@@ -56,7 +56,7 @@ OBJECT_TYPES = [
 ]
 # Order in which object types are applied so references resolve (groups
 # reference addresses/services, objects reference tags).
-BUILD = "2026-11-13o (where-used: edit address groups via REST, diff/commit/revert/pending)"
+BUILD = "2026-11-13p (where-used: post-export action menu: [1] groups, [2] rules)"
 APPLY_ORDER = ["tag", "application", "service", "service-group", "address",
                "address-group"]
 DG_GROUPS = ("DevGroup", "DynGroup")  # static and dynamic device groups
@@ -1778,14 +1778,24 @@ def _where_used_once(client: PanoramaClient, locations: list[str],
 
     editable_groups = [r for r in grows
                        if r.get("type") == "address-group"]
-    if editable_groups and input(
-            "\nAdd address/address-group objects to the group(s) that "
-            "use this object? y to edit, Enter=skip: ").strip().lower() == "y":
-        _add_to_groups(client, objects, editable_groups, query)
-
-    if records and input("\nAdd address/address-group objects to these rules? "
-                         "y to edit, Enter=skip: ").strip().lower() == "y":
-        _add_to_rules(client, objects, records, query)
+    if grows or records:
+        print("\nNext action:")
+        print("  [1] add/modify address groups that use this object"
+              + ("" if editable_groups else "  (no address groups found)"))
+        print("  [2] add address/address-group objects to existing rules "
+              "that use this object" + ("" if records else
+                                        "  (no rule references)"))
+        sel = input("Select number (Enter=skip): ").strip()
+        if sel == "1":
+            if editable_groups:
+                _add_to_groups(client, objects, editable_groups, query)
+            else:
+                print("  Nothing to edit: no matching address groups.")
+        elif sel == "2":
+            if records:
+                _add_to_rules(client, objects, records, query)
+            else:
+                print("  Nothing to edit: no rule references.")
 
 
 def _prompt_add_names(objects: dict) -> list[str] | None:
