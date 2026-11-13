@@ -56,7 +56,7 @@ OBJECT_TYPES = [
 ]
 # Order in which object types are applied so references resolve (groups
 # reference addresses/services, objects reference tags).
-BUILD = "2026-11-13b (action menu loops: list/export/import/convert repeatedly)"
+BUILD = "2026-11-13c (convert-more re-picks object type)"
 APPLY_ORDER = ["tag", "application", "service", "service-group", "address",
                "address-group"]
 DG_GROUPS = ("DevGroup", "DynGroup")  # static and dynamic device groups
@@ -1694,9 +1694,10 @@ def copy_or_move_to_shared(client: PanoramaClient, device_group: str,
         return
     while True:
         _copy_move_pass(client, device_group, obj_type)
-        more = ["convert more objects", "finish"]
+        more = ["convert more objects (re-pick object type)", "finish"]
         if choose(more, "More") != more[0]:
             return
+        obj_type = choose(OBJECT_TYPES, "Object types")
 
 
 def _move_diff_lines(device_group: str, before_fields: dict | None,

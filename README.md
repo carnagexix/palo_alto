@@ -132,9 +132,10 @@ Flow mirrors import:
    move: restores objects in the device group and deletes the shared copies;
    for copy: deletes only the shared copies - the source objects were never
    touched; writes its own revert diff), **[3] leave pending**.
-4. **More** menu: **[1] convert more objects** runs another pass - the object
-   list is re-read, so freshly moved/copied entries reflect current state -
-   **[2] finish** returns.
+4. **More** menu: **[1] convert more objects** returns to the **Object types**
+   selection (so you can convert a different type next), then the object list
+   is re-read so freshly moved/copied entries reflect current state;
+   **[2] finish** returns to the Action menu.
 
 Note: source objects are read from the committed (running) config, so
 uncommitted changes made in the Panorama UI are not included in a move.
