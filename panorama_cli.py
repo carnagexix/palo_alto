@@ -56,7 +56,7 @@ OBJECT_TYPES = [
 ]
 # Order in which object types are applied so references resolve (groups
 # reference addresses/services, objects reference tags).
-BUILD = "2026-11-13n (fix: index address-group members under <static> for group usage search)"
+BUILD = "2026-11-13o (where-used: edit address groups via REST, diff/commit/revert/pending)"
 APPLY_ORDER = ["tag", "application", "service", "service-group", "address",
                "address-group"]
 DG_GROUPS = ("DevGroup", "DynGroup")  # static and dynamic device groups
@@ -1629,7 +1629,8 @@ def _where_used_once(client: PanoramaClient, locations: list[str],
                          "location": obj["location"],
                          "contains": ", ".join(
                              objects[m]["name"] if m in objects else m
-                             for m in hit_members)})
+                             for m in hit_members),
+                         "_key": gl})
         return rows
 
     grows = group_rows()
@@ -1766,34 +1767,42 @@ def _where_used_once(client: PanoramaClient, locations: list[str],
                        "generated": datetime.now().isoformat(
                            timespec="seconds"),
                        "object_matches": obj_rows,
-                       "group_references": grows,
+                       "group_references": [
+                           {k: v for k, v in r.items()
+                            if not k.startswith("_")} for r in grows],
                        "rule_references": export_records}
             with open(path, "w", encoding="utf-8") as fh:
                 json.dump(payload, fh, indent=2, ensure_ascii=False)
             print(f"Wrote {len(obj_rows)} object match(es) and "
                   f"{len(export_records)} rule reference(s) to {path}")
 
+    editable_groups = [r for r in grows
+                       if r.get("type") == "address-group"]
+    if editable_groups and input(
+            "\nAdd address/address-group objects to the group(s) that "
+            "use this object? y to edit, Enter=skip: ").strip().lower() == "y":
+        _add_to_groups(client, objects, editable_groups, query)
+
     if records and input("\nAdd address/address-group objects to these rules? "
                          "y to edit, Enter=skip: ").strip().lower() == "y":
         _add_to_rules(client, objects, records, query)
 
 
-def _add_to_rules(client: PanoramaClient, objects: dict, records: list,
-                  query: str = "") -> None:
-    """Append address/address-group members to the rule fields (source /
-    destination) where the searched object was actually found."""
+def _prompt_add_names(objects: dict) -> list[str] | None:
+    """Prompt for address/address-group names to add. Returns the validated
+    list of existing object names, or None when there is nothing to add."""
     raw = input("Address or address-group object name(s) to add "
                 "(comma-separated, or '@file.txt' one per line): ") \
         .strip().strip('"')
     if not raw:
-        return
+        return None
     if raw.startswith("@") or raw.lower().endswith((".txt", ".csv")):
         try:
             names = _names_from_convert_file(
                 raw.lstrip("@").strip().strip('"').strip("'"))
         except OSError as exc:
             print(f"  Could not read file: {exc}")
-            return
+            return None
     else:
         names = [t for t in raw.replace(",", " ").split() if t]
     adds, missing, seen = [], [], set()
@@ -1815,6 +1824,165 @@ def _add_to_rules(client: PanoramaClient, objects: dict, records: list,
             print(f"    ... and {len(missing) - 20} more")
     if not adds:
         print("  No valid address/address-group objects to add.")
+        return None
+    return adds
+
+
+def _group_members(entry: dict) -> list[str]:
+    """Member list of an address group entry in either XML or REST shape."""
+    return member_values(entry.get("static", entry))
+
+
+def _add_to_groups(client: PanoramaClient, objects: dict, grows: list,
+                   query: str = "") -> None:
+    """Append address/address-group members to the address groups that
+    reference the searched object (group writes work through the REST
+    objects API, unlike rule writes)."""
+    adds = _prompt_add_names(objects)
+    if adds is None:
+        return
+    plan = []
+    for row in grows:
+        obj = objects.get(row["_key"]) or {}
+        loc = obj.get("location", SHARED_LABEL)
+        name = row["name"]
+        base = None
+        try:
+            entry = client.rest_get_entry("address-group", loc, name)
+            if isinstance(entry, dict):
+                base = dict(entry)
+        except RuntimeError as exc:
+            print(f"  NOTE  could not read '{name}' via REST: {exc}",
+                  file=sys.stderr)
+        if base is None:
+            base = {k: v for k, v in obj.get("fields", {}).items()
+                    if k != "name"}
+        members = _group_members(base)
+        if not members:
+            print(f"  NOTE  '{name}': no static members (dynamic group?); "
+                  "skipped")
+            continue
+        have = {m.lower() for m in members}
+        to_add = [a for a in adds if a.lower() not in have]
+        if not to_add:
+            continue
+        new_base = {**base, "static": {"member": list(members) + to_add}}
+        orig_base = {**base, "static": {"member": list(members)}}
+        plan.append((row, loc, list(members), orig_base, new_base, to_add))
+    if not plan:
+        print("  Nothing to change: the members are already present in all "
+              "these groups.")
+        return
+
+    print(f"\nWill update {len(plan)} address group(s):")
+    for row, _loc, members, _o, new_base, _t in plan:
+        print(f"  {row['name']} ({row['location']})")
+        print(f"    before: members: {' | '.join(members)}")
+        print(f"    after : members: "
+              f"{' | '.join(member_values(new_base['static']))}")
+    if input("Type 'yes' to update these groups: ").strip().lower() != "yes":
+        print("Group update cancelled.")
+        return
+
+    ok, failed, statuses = 0, [], []
+    for row, loc, _m, _o, new_base, _t in plan:
+        try:
+            client.rest_write("address-group", loc, row["name"], new_base,
+                              create=False)
+            statuses.append(("UPDATED", ""))
+            ok += 1
+        except RuntimeError as exc:
+            statuses.append(("FAILED", str(exc)))
+            failed.append((row["name"], str(exc)))
+    print(f"\nUpdated {ok}/{len(plan)} group(s).")
+    for name, err in failed[:5]:
+        print(f"  FAILED {name}: {err}", file=sys.stderr)
+
+    diff_entries = [(row, loc, members, new_base["static"], to_add)
+                    for row, loc, members, _o, new_base, to_add in plan]
+    diff_path, diff_text = _group_edit_diff(query, adds, diff_entries,
+                                            statuses, "applied",
+                                            "group-edit")
+    _move_print_diff(diff_text, diff_path)
+    if ok:
+        actions = ["commit changes (optional description)",
+                   "revert these group changes", "leave pending"]
+        action = choose(actions, "Post-update")
+        if action == actions[0]:
+            commit_changes(client)
+        elif action == actions[1]:
+            _revert_group_changes(client, query, plan, statuses)
+
+
+def _group_edit_diff(query: str, adds: list[str], entries: list[tuple],
+                     statuses: list[tuple[str, str]], phase: str,
+                     suffix: str) -> tuple[str, str]:
+    """entries: (group_row, location, before_members, after_static, added)."""
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = safe_filename("where-used", f"{query}_{suffix}_{ts}", "txt")
+    header = (f"Panorama address-group member diff\n"
+              f"Query       : {query}\n"
+              f"Adding      : {', '.join(adds) if adds else '-'}\n"
+              f"Phase       : {phase}\n"
+              f"Generated   : "
+              f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+              f"(group static members before -> after)\n"
+              + "=" * 60 + "\n\n")
+    body = []
+    for (row, loc, before, after_static, to_add), (status, err) in \
+            zip(entries, statuses):
+        body.append(f"[{status}] [{row['type']}] {row['name']} ({loc})")
+        body.append(f"  - before: members: {' | '.join(before)}")
+        body.append(f"  + after : members: "
+                    f"{' | '.join(member_values(after_static))}")
+        if to_add:
+            body.append(f"  + added : members: {', '.join(to_add)}")
+        if err:
+            body.append(f"  ! {err}")
+        body.append("")
+    text = header + "\n".join(body)
+    Path(path).write_text(text, encoding="utf-8")
+    return path, text
+
+
+def _revert_group_changes(client: PanoramaClient, query: str, plan: list,
+                          statuses: list) -> None:
+    """Restore the original static members of the groups that were updated."""
+    entries = [(row, loc, member_values(new_base["static"]), orig_base, [])
+               for (row, loc, _m, orig_base, new_base, _t), (st, _e)
+               in zip(plan, statuses) if st == "UPDATED"]
+    if not entries:
+        print("Nothing to revert (no group changes applied).")
+        return
+    ok, rstatus = 0, []
+    for row, loc, _before, orig_base, _add in entries:
+        try:
+            client.rest_write("address-group", loc, row["name"], orig_base,
+                              create=False)
+            rstatus.append(("REVERTED", ""))
+            ok += 1
+        except RuntimeError as exc:
+            rstatus.append(("FAILED", str(exc)))
+    print(f"\nReverted {ok}/{len(entries)} group(s) to their original "
+          "members.")
+    diff_entries = [(row, loc, before, orig["static"], [])
+                    for (row, loc, before, orig, _add) in entries]
+    diff_path, diff_text = _group_edit_diff(query, [], diff_entries,
+                                            rstatus, "reverted",
+                                            "group-revert")
+    _move_print_diff(diff_text, diff_path)
+    if ok:
+        actions = ["commit changes (optional description)", "leave pending"]
+        if choose(actions, "Post-revert") == actions[0]:
+            commit_changes(client)
+
+
+def _add_to_rules(client: PanoramaClient, objects: dict, records: list,
+                  query: str = "") -> None:
+    """Append address/address-group members to the rule fields (source /
+    destination) where the searched object was actually found."""
+    adds = _prompt_add_names(objects)
+    if adds is None:
         return
 
     plan, skipped, seen_plan = [], [], set()
@@ -2015,7 +2183,9 @@ def _rule_edit_diff(query: str, adds: list[str], entries: list[tuple],
         if err:
             body.append(f"  ! {err}")
         body.append("")
-    return path, header + "\n".join(body)
+    text = header + "\n".join(body)
+    Path(path).write_text(text, encoding="utf-8")
+    return path, text
 
 
 def _revert_rule_changes(client: PanoramaClient, query: str,

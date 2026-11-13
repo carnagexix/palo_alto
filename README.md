@@ -172,6 +172,15 @@ Mode menu). At the `Export results` prompt: `c` writes
 a single `where-used_<query>_<ts>.json` containing all three. Enter skips
 export (results are always printed to the screen).
 
+When groups were found, a separate prompt offers **adding address /
+address-group objects to those groups** (address groups only): the same
+name validation and before/after preview apply. **Group writes work
+through the modern REST objects API** even on builds that block everything
+else, so these edits actually take effect. After applying, a
+`where-used_<query>_group-edit_<ts>.txt` diff is written, and the post-update
+menu offers **commit (optional description)**, **revert these group changes**
+(`..._group-revert_<ts>.txt` diff) or **leave pending**.
+
 When rules were found, an extra prompt offers **adding address /
 address-group objects to those rules**: enter names comma-separated, or
 `@file.txt` with one name per line. Names that do not exist (or are not
