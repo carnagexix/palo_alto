@@ -56,7 +56,7 @@ OBJECT_TYPES = [
 ]
 # Order in which object types are applied so references resolve (groups
 # reference addresses/services, objects reference tags).
-BUILD = "2026-11-12e (nested service protocol shape from schema probe)"
+BUILD = "2026-11-13a (copy/move: convert-more loop, @file name list)"
 APPLY_ORDER = ["tag", "application", "service", "service-group", "address",
                "address-group"]
 DG_GROUPS = ("DevGroup", "DynGroup")  # static and dynamic device groups
@@ -1516,12 +1516,50 @@ def revert_move(client: PanoramaClient, device_group: str, obj_type: str,
         commit_changes(client)
 
 
-def copy_or_move_to_shared(client: PanoramaClient, device_group: str,
-                           obj_type: str) -> None:
-    """Copy (or move) objects from a device group into (shared) keeping all
-    properties. Move additionally removes them from the device group.
-    Names that already exist as shared objects are skipped, never
-    overwritten."""
+def _names_from_convert_file(path: str) -> list[str]:
+    names: list[str] = []
+    text = Path(path).read_text(encoding="utf-8", errors="replace")
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        names.extend(t for t in line.replace(",", " ").split() if t)
+    return names
+
+
+def _entries_from_convert_file(path: str, entries: list[dict],
+                               obj_type: str,
+                               device_group: str) -> list[dict]:
+    try:
+        names = _names_from_convert_file(path)
+    except OSError as exc:
+        print(f"  Could not read '{path}': {exc}")
+        return []
+    print(f"  Loaded {len(names)} object name(s) from '{path}'.")
+    by_exact = {e["name"]: e for e in entries}
+    by_lower = {e["name"].lower(): e for e in entries}
+    selected, missing, seen = [], [], set()
+    for name in names:
+        entry = by_exact.get(name) or by_lower.get(name.lower())
+        if entry is None:
+            missing.append(name)
+        elif entry["name"] not in seen:
+            seen.add(entry["name"])
+            selected.append(entry)
+    if missing:
+        print(f"  MISSING  {len(missing)} name(s) not found as '{obj_type}' "
+              f"objects in '{device_group}':")
+        for name in missing[:20]:
+            print(f"    ? {name}")
+        if len(missing) > 20:
+            print(f"    ... and {len(missing) - 20} more")
+    if not selected:
+        print("  No matching objects to convert.")
+    return selected
+
+
+def _copy_move_pass(client: PanoramaClient, device_group: str,
+                    obj_type: str) -> None:
     if device_group == SHARED_LABEL:
         print("Nothing to do: these objects are already shared.")
         return
@@ -1536,10 +1574,14 @@ def copy_or_move_to_shared(client: PanoramaClient, device_group: str,
     for i, entry in enumerate(entries, start=1):
         print(f"  [{i}] {entry['name']}")
     verb = "Copy" if mode == "copy" else "Move"
-    raw = input(f"{verb} numbers to shared (comma-separated, 'a' = all): ") \
-        .strip().lower()
-    if raw in ("a", "all"):
+    raw = input(f"{verb} numbers to shared (comma-separated, 'a' = all, "
+                "or '@file.txt' with one name per line): ").strip()
+    if raw.lower() in ("a", "all"):
         selected = list(entries)
+    elif raw.startswith("@") or raw.lower().endswith((".txt", ".csv")):
+        selected = _entries_from_convert_file(
+            raw.lstrip("@").strip().strip('"').strip("'"), entries,
+            obj_type, device_group)
     else:
         nums = []
         for part in raw.replace(" ", ",") .split(","):
@@ -1637,6 +1679,24 @@ def copy_or_move_to_shared(client: PanoramaClient, device_group: str,
     elif action == actions[1]:
         revert_move(client, device_group, obj_type,
                     [(n, f, True) for n, f in undoable], mode)
+
+
+def copy_or_move_to_shared(client: PanoramaClient, device_group: str,
+                           obj_type: str) -> None:
+    """Copy (or move) objects from a device group into (shared) keeping all
+    properties. Move additionally removes them from the device group.
+    Names that already exist as shared objects are skipped, never
+    overwritten. After each pass the user can run another pass (objects are
+    re-listed, so convert as many batches as needed); the selection can also
+    be a text file with one object name per line ('@names.txt')."""
+    if device_group == SHARED_LABEL:
+        print("Nothing to do: these objects are already shared.")
+        return
+    while True:
+        _copy_move_pass(client, device_group, obj_type)
+        more = ["convert more objects", "finish"]
+        if choose(more, "More") != more[0]:
+            return
 
 
 def _move_diff_lines(device_group: str, before_fields: dict | None,

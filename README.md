@@ -107,9 +107,12 @@ a real device group is selected), then pick a mode:
   is valid PAN-OS scoping).
 - **move** - creates the shared object, then deletes the device-group object.
 
-Pick object type, then select entries by number (`a` = all). Each object is
-recreated in **(shared)** with the same name and all properties. Names that
-already exist as shared objects are **skipped, never overwritten**.
+Pick object type, then select entries by number (`a` = all) or give a list
+file: `@names.txt` - one object name per line (blank lines and `#` comments
+ignored, a line may contain several comma-separated names; unmatched names are
+reported as `MISSING`). Each object is recreated in **(shared)** with the same
+name and all properties. Names that already exist as shared objects are
+**skipped, never overwritten**.
 
 Flow mirrors import:
 
@@ -124,6 +127,9 @@ Flow mirrors import:
    move: restores objects in the device group and deletes the shared copies;
    for copy: deletes only the shared copies - the source objects were never
    touched; writes its own revert diff), **[3] leave pending**.
+4. **More** menu: **[1] convert more objects** runs another pass - the object
+   list is re-read, so freshly moved/copied entries reflect current state -
+   **[2] finish** returns.
 
 Note: source objects are read from the committed (running) config, so
 uncommitted changes made in the Panorama UI are not included in a move.
