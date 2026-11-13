@@ -56,7 +56,7 @@ OBJECT_TYPES = [
 ]
 # Order in which object types are applied so references resolve (groups
 # reference addresses/services, objects reference tags).
-BUILD = "2026-11-13g (rule search: add addresses/groups to found rules)"
+BUILD = "2026-11-13h (rule edit: target found field, before/after diff, commit desc)"
 APPLY_ORDER = ["tag", "application", "service", "service-group", "address",
                "address-group"]
 DG_GROUPS = ("DevGroup", "DynGroup")  # static and dynamic device groups
@@ -1589,6 +1589,7 @@ def _where_used_once(client: PanoramaClient, locations: list[str],
                 f"{f}: {'|'.join(ms)}" for f, ms in matched.items())
             rec["matched_objects"] = ", ".join(dict.fromkeys(matched_objs))
             rec["indirectly_via"] = "; ".join(dict.fromkeys(via_notes))
+            rec["_fields"] = sorted(matched)
             rec["_rule"] = rule
             rec["_rb"] = rb
             records.append(rec)
@@ -1674,13 +1675,13 @@ def _where_used_once(client: PanoramaClient, locations: list[str],
 
     if records and input("\nAdd address/address-group objects to these rules? "
                          "y to edit, Enter=skip: ").strip().lower() == "y":
-        _add_to_rules(client, objects, records)
+        _add_to_rules(client, objects, records, query)
 
 
-def _add_to_rules(client: PanoramaClient, objects: dict,
-                  records: list) -> None:
-    """Append address/address-group members to the source or destination
-    member list of the rules found in the current search."""
+def _add_to_rules(client: PanoramaClient, objects: dict, records: list,
+                  query: str = "") -> None:
+    """Append address/address-group members to the rule fields (source /
+    destination) where the searched object was actually found."""
     raw = input("Address or address-group object name(s) to add "
                 "(comma-separated, or '@file.txt' one per line): ") \
         .strip().strip('"')
@@ -1716,13 +1717,17 @@ def _add_to_rules(client: PanoramaClient, objects: dict,
         print("  No valid address/address-group objects to add.")
         return
 
-    field = choose(["source", "destination", "both"], "Add members to field")
-    fields = ["source", "destination"] if field == "both" else [field]
-
     plan, skipped, seen_plan = [], [], set()
     for rec in records:
         rule, rb = rec["_rule"], rec["_rb"]
-        for fld in fields:
+        hit_fields = [f for f in rec.get("_fields", [])
+                      if f in ("source", "destination")]
+        if not hit_fields:
+            skipped.append(f"[{rb}] {rec['location']}/{rec['rule']}: object "
+                           "referenced only in non-address field(s) "
+                           f"({', '.join(rec.get('_fields') or ['?'])})")
+            continue
+        for fld in hit_fields:
             key = (rec["location"], rb, rec["rule"], fld)
             if key in seen_plan:
                 continue
@@ -1739,10 +1744,10 @@ def _add_to_rules(client: PanoramaClient, objects: dict,
                 continue
             base = dict(cur) if isinstance(cur, dict) else {}
             base.pop("member", None)
-            plan.append((rec, fld, {**base, "member":
-                                    list(members) + to_add}, to_add))
+            plan.append((rec, fld, members,
+                         {**base, "member": list(members) + to_add}, to_add))
     if skipped:
-        print("\n  Skipped rules (cannot append to a non-member field):")
+        print("\n  Skipped:")
         for note in dict.fromkeys(skipped):
             print(f"    {note}")
     if not plan:
@@ -1750,16 +1755,45 @@ def _add_to_rules(client: PanoramaClient, objects: dict,
               "these rules.")
         return
 
-    print(f"\nWill add to {len(plan)} rule field(s):")
-    for rec, fld, _val, to_add in plan:
-        print(f"  [{rec['_rb']}] {rec['location']}/{rec['rule']} {fld}: "
-              f"+ {', '.join(to_add)}")
+    print(f"\nWill update {len(plan)} rule field(s):")
+    for rec, fld, members, new_val, _to_add in plan:
+        print(f"  [{rec['_rb']}] {rec['location']}/{rec['rule']} {fld}")
+        print(f"    before: {' | '.join(members)}")
+        print(f"    after : {' | '.join(member_values(new_val))}")
     if input("Type 'yes' to update these rules: ").strip().lower() != "yes":
         print("Rule update cancelled.")
         return
 
-    ok, failed = 0, []
-    for rec, fld, new_val, _to_add in plan:
+    def _rule_diff(phase: str, statuses: list[tuple[str, str]]) \
+            -> tuple[str, str]:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = safe_filename("where-used",
+                             f"{query}_rule-edit_{ts}", "txt")
+        header = (f"Panorama rule member diff\n"
+                  f"Query       : {query}\n"
+                  f"Adding      : {', '.join(adds)}\n"
+                  f"Phase       : {phase}\n"
+                  f"Generated   : "
+                  f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                  f"(source/destination member lists before -> after)\n"
+                  + "=" * 60 + "\n\n")
+        body = []
+        for (rec, fld, members, new_val, to_add), (status, err) in \
+                zip(plan, statuses):
+            body.append(f"[{status}] [{rec['_rb']}] "
+                        f"{rec['location']}/{rec['rule']}  {fld}")
+            if err:
+                body.append(f"  ! {err}")
+            body.append(f"  - before: {' | '.join(members)}")
+            if status == "UPDATED":
+                body.append(f"  + after : "
+                            f"{' | '.join(member_values(new_val))}")
+                body.append("  + added : " + ", ".join(to_add))
+            body.append("")
+        return path, header + "\n".join(body)
+
+    ok, failed, statuses = 0, [], []
+    for rec, fld, members, new_val, _to_add in plan:
         loc, rb, rname = rec["location"], rec["_rb"], rec["rule"]
         err = ""
         done = False
@@ -1771,6 +1805,7 @@ def _add_to_rules(client: PanoramaClient, objects: dict,
                 break
             except RuntimeError as exc:
                 err = str(exc)
+        last_err = err
         if not done:
             full_rule = {k: v for k, v in rec["_rule"].items()
                          if k != "name"}
@@ -1779,15 +1814,20 @@ def _add_to_rules(client: PanoramaClient, objects: dict,
                 client.rest_rule_update(loc, rb, rname, full_rule)
                 done = True
             except RuntimeError as exc:
-                failed.append((f"{loc}/{rname} ({fld})",
-                               f"XML: {err}; REST rules: {exc}"))
-        if done:
-            ok += 1
+                last_err = f"XML: {err}; REST rules: {exc}"
+                failed.append((f"{loc}/{rname} ({fld})", last_err))
+                statuses.append(("FAILED", last_err))
+                continue
+        statuses.append(("UPDATED", ""))
+        ok += 1
     print(f"\nUpdated {ok}/{len(plan)} rule field(s).")
     for name, err in failed[:5]:
         print(f"  FAILED {name}: {err}", file=sys.stderr)
-    if not failed:
-        actions = ["commit changes", "leave pending"]
+
+    diff_path, diff_text = _rule_diff("applied", statuses)
+    _move_print_diff(diff_text, diff_path)
+    if ok:
+        actions = ["commit changes (optional description)", "leave pending"]
         if choose(actions, "Post-update") == actions[0]:
             commit_changes(client)
 
