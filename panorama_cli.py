@@ -56,7 +56,7 @@ OBJECT_TYPES = [
 ]
 # Order in which object types are applied so references resolve (groups
 # reference addresses/services, objects reference tags).
-BUILD = "2026-11-13j (rule edit: revert option, rule-revert diff, field labels)"
+BUILD = "2026-11-13k (rule write: op load/partial attempt, CLI script fallback)"
 APPLY_ORDER = ["tag", "application", "service", "service-group", "address",
                "address-group"]
 DG_GROUPS = ("DevGroup", "DynGroup")  # static and dynamic device groups
@@ -282,6 +282,26 @@ class PanoramaClient:
 
     def config_delete(self, path: str):
         return self.config_write("delete", path)
+
+    def op_partial_config_load(self, subtree_xml: str):
+        """Write a config subtree through the op API's load/partial command.
+
+        type=op works even when type=config set is refused (code 16), and
+        partial-load is the classic route for Panorama rule bulk changes."""
+        cmd = f"<load><config><partial>{subtree_xml}</partial></config></load>"
+        data = {"key": self.api_key, "api-version": API_VERSION,
+                "type": "op", "cmd": cmd}
+        url = f"https://{self.host}/api/{API_VERSION}"
+        try:
+            return self._handle_response(
+                self.session.post(url, data=data, timeout=self.timeout,
+                                  verify=False), url, data)
+        except RuntimeError as exc:
+            if "code 16" not in str(exc):
+                raise
+            return self._handle_response(
+                self.session.get(url, params=data, timeout=self.timeout,
+                                 verify=False), url, data)
 
     # ---------------- Modern REST API (panui_restapi) ------------------- #
     def _rest(self, method: str, path: str, params: dict | None = None,
@@ -1801,6 +1821,13 @@ def _add_to_rules(client: PanoramaClient, objects: dict, records: list,
     print(f"\nUpdated {ok}/{len(plan)} rule field(s).")
     for name, err in failed[:5]:
         print(f"  FAILED {name}: {err}", file=sys.stderr)
+    if failed:
+        if getattr(client, "_rule_write_unsupported", False):
+            print("NOTE: this Panorama build accepts no API rule writes; "
+                  "a CLI script was generated instead.", file=sys.stderr)
+        cli_path, cli_text = _rule_cli_script(query, plan, statuses)
+        Path(cli_path).write_text(cli_text, encoding="utf-8")
+        print(f"CLI fallback script saved to {cli_path}")
 
     diff_entries = [(rec, fld, members, new_val, to_add)
                     for rec, fld, members, _o, new_val, to_add in plan]
@@ -1817,25 +1844,87 @@ def _add_to_rules(client: PanoramaClient, objects: dict, records: list,
             _revert_rule_changes(client, query, plan, statuses)
 
 
+def _partial_rule_subtree(rec: dict, fld: str, new_val) -> str:
+    """Build a load/config/partial subtree that replaces one rule field."""
+    def q(v):
+        return escape(str(v), {'"': "&quot;"})
+    body = xml_value(fld, new_val)
+    entry = f"<entry name=\"{q(rec['rule'])}\">{body}</entry>"
+    xml = f"<rules>{entry}</rules>"
+    for seg in reversed(str(rec["_rb"]).split("/")):
+        xml = f"<{seg}>{xml}</{seg}>"
+    xml = f"<rules>{xml}</rules>"
+    if rec["location"] == SHARED_LABEL:
+        return f"<shared>{xml}</shared>"
+    return (f"<device-group><entry "
+            f"name=\"{q(rec['location'])}\">{xml}</entry>"
+            f"</device-group>")
+
+
+def _rule_cli_script(query: str, plan: list,
+                     statuses: list[tuple[str, str]]) -> tuple[str, str]:
+    """CLI 'set' lines (Panorama config mode) for the fields that failed."""
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = safe_filename("where-used", f"{query}_rule-edit-cli_{ts}", "txt")
+    lines = [f"! Panorama CLI to apply the rule changes for query '{query}'",
+             "! on the Panorama CLI: 'configure', paste these lines, then "
+             "'commit'", ""]
+    for (rec, fld, _m, _o, new_val, _t), (st, _e) in zip(plan, statuses):
+        if st == "UPDATED":
+            continue
+        rb = str(rec["_rb"]).replace("/", " ")
+        tgt = ("shared" if rec["location"] == SHARED_LABEL
+               else f"device-group {rec['location']}")
+        q = "'" + str(rec["rule"]).replace("'", "''") + "'"
+        lines.append(f"clear {tgt} {rb} rules {q} {fld} member")
+        for m in member_values(new_val):
+            lines.append(f"set {tgt} {rb} rules {q} {fld} member "
+                         f"'{str(m).replace(chr(39), chr(39) * 2)}'")
+        lines.append("")
+    return path, "\n".join(lines)
+
+
 def _write_rule_field(client: PanoramaClient, rec: dict, fld: str,
                       new_val) -> tuple[bool, str]:
-    """Set one rule field (XML API paths first, REST rules endpoint after)."""
+    """Set one rule field: XML config-set paths, then op load/partial,
+    then the REST rules endpoint. Short-circuits once the build is known
+    to reject every rule-write path."""
+    if getattr(client, "_rule_write_unsupported", False):
+        return False, getattr(client, "_rule_write_reason",
+                              "no supported rule-write path on this build")
     loc, rb, rname = rec["location"], rec["_rb"], rec["rule"]
-    err = ""
+    errs: list[str] = []
     element = xml_value(fld, new_val)
+    err = ""
     for path in rule_field_paths(loc, rb, rname, fld):
         try:
             client.config_set(path, element)
             return True, ""
         except RuntimeError as exc:
             err = str(exc)
+    errs.append(f"XML: {err}")
+    try:
+        client.op_partial_config_load(_partial_rule_subtree(rec, fld,
+                                                            new_val))
+        return True, ""
+    except RuntimeError as exc:
+        errs.append(f"op partial-load: {exc}")
     full_rule = {k: v for k, v in rec["_rule"].items() if k != "name"}
     full_rule[fld] = new_val
     try:
         client.rest_rule_update(loc, rb, rname, full_rule)
         return True, ""
     except RuntimeError as exc:
-        return False, f"XML: {err}; REST rules: {exc}"
+        errs.append(f"REST rules: {exc}")
+    reason = "; ".join(errs)
+    if ("code 16" in reason and any(m in reason for m in (
+            "Route Not Found", "HTTP 501", "Version Not Supported"))):
+        client._rule_write_unsupported = True
+        client._rule_write_reason = (
+            "this Panorama build exposes no rule-write path (XML config set: "
+            "unauth code 16; op load/partial refused; REST rules routes "
+            "return 501 Route Not Found)")
+    return False, reason
 
 
 def _rule_edit_diff(query: str, adds: list[str], entries: list[tuple],
