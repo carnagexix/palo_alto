@@ -56,7 +56,7 @@ OBJECT_TYPES = [
 ]
 # Order in which object types are applied so references resolve (groups
 # reference addresses/services, objects reference tags).
-BUILD = "2026-11-13e (app default.port members 'tcp/8001'; service-group 'members')"
+BUILD = "2026-11-13f (rule search: list object names, csv/json export, repeat)"
 APPLY_ORDER = ["tag", "application", "service", "service-group", "address",
                "address-group"]
 DG_GROUPS = ("DevGroup", "DynGroup")  # static and dynamic device groups
@@ -1543,59 +1543,91 @@ def _where_used_once(client: PanoramaClient, locations: list[str],
 
     print(f"\nQuery '{query}': {len(direct)} matching object(s), "
           f"{len(records)} rule reference(s).")
-    if not records:
-        print("No rules reference this object, or any group that contains it.")
-        return
+    print(f"\nMatched object(s) for '{query}':")
+    for n in sorted(direct):
+        obj = objects[n]
+        summary = _obj_summary(obj["fields"])
+        print(f"  {obj['name']} ({obj['type']}, {obj['location']})"
+              + (f"  [{summary}]" if summary else ""))
 
-    fmt = choose(["text", "csv", "json"], "Output format")
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    ext = "txt" if fmt == "text" else fmt
-    path = safe_filename("where-used", f"{query}_{ts}", ext)
-
-    text_lines: list[str] = []
-    current_loc = None
-    for rec in records:
-        if rec["location"] != current_loc:
-            current_loc = rec["location"]
-            text_lines.append(f"\n=== {current_loc} ===")
-        flag = (" [disabled]"
-                if str(rec.get("disabled", "")).lower() == "yes" else "")
-        text_lines.append(f"  [{rec['rulebase']}] {rec['rule']}{flag}")
-        text_lines.append(f"      used in: {rec['used_in']}")
-        text_lines.append(f"      objects: {rec['matched_objects']}")
-        if rec["indirectly_via"]:
-            text_lines.append(f"      indirectly: {rec['indirectly_via']}")
-        for key in ("from", "to", "source", "destination", "service",
-                    "application", "action", "negated", "description"):
-            if rec.get(key):
-                text_lines.append(f"      {key}: {rec[key]}")
-
-    if fmt == "text":
+    if records:
+        print()
+        text_lines: list[str] = []
+        current_loc = None
+        for rec in records:
+            if rec["location"] != current_loc:
+                current_loc = rec["location"]
+                text_lines.append(f"=== {current_loc} ===")
+            flag = (" [disabled]"
+                    if str(rec.get("disabled", "")).lower() == "yes" else "")
+            text_lines.append(f"  [{rec['rulebase']}] {rec['rule']}{flag}")
+            text_lines.append(f"      used in: {rec['used_in']}")
+            text_lines.append(f"      objects: {rec['matched_objects']}")
+            if rec["indirectly_via"]:
+                text_lines.append(f"      indirectly: {rec['indirectly_via']}")
+            for key in ("from", "to", "source", "destination", "service",
+                        "application", "action", "negated", "description"):
+                if rec.get(key):
+                    text_lines.append(f"      {key}: {rec[key]}")
         print("\n".join(text_lines))
-        Path(path).write_text("\n".join(text_lines), encoding="utf-8")
-        print(f"\nSaved to {path}")
-    elif fmt == "json":
-        payload = {"query": query,
-                   "generated": datetime.now().isoformat(timespec="seconds"),
-                   "object_matches": sorted(objects[n]["name"]
-                                            for n in direct),
-                   "rule_references": records}
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh, indent=2, ensure_ascii=False)
-        print(f"Wrote {len(records)} rule reference(s) to {path}")
     else:
+        print("\nNo rules reference these objects, or any group that "
+              "contains them.")
+
+    fmt = input("\nExport results (c=csv, j=json, Enter=skip): ").strip().lower()
+    if fmt not in ("c", "csv", "j", "json"):
+        return
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    obj_rows = [{"name": objects[n]["name"], "type": objects[n]["type"],
+                 "location": objects[n]["location"],
+                 "summary": _obj_summary(objects[n]["fields"])}
+                for n in sorted(direct)]
+    if fmt in ("c", "csv"):
+        obj_path = safe_filename("where-used", f"{query}_objects_{ts}", "csv")
+        with open(obj_path, "w", encoding="utf-8", newline="") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(["name", "type", "location", "summary"])
+            for row in obj_rows:
+                writer.writerow([row["name"], row["type"], row["location"],
+                                 row["summary"]])
+        print(f"Wrote {len(obj_rows)} object match(es) to {obj_path}")
+        rule_path = safe_filename("where-used", f"{query}_rules_{ts}", "csv")
         keys = (["location", "rulebase", "rule", "used_in",
                  "matched_objects", "indirectly_via"] +
                 [k for k in RULE_DETAIL_KEYS
                  if k not in ("source", "destination", "service",
                               "application")])
         keys = list(dict.fromkeys(keys))
-        with open(path, "w", encoding="utf-8", newline="") as fh:
+        with open(rule_path, "w", encoding="utf-8", newline="") as fh:
             writer = csv.writer(fh)
             writer.writerow(keys)
             for rec in records:
                 writer.writerow([rec.get(key, "") for key in keys])
-        print(f"Wrote {len(records)} rule reference(s) to {path}")
+        print(f"Wrote {len(records)} rule reference(s) to {rule_path}")
+    else:
+        path = safe_filename("where-used", f"{query}_{ts}", "json")
+        payload = {"query": query,
+                   "generated": datetime.now().isoformat(timespec="seconds"),
+                   "object_matches": obj_rows,
+                   "rule_references": records}
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2, ensure_ascii=False)
+        print(f"Wrote {len(obj_rows)} object match(es) and {len(records)} "
+              f"rule reference(s) to {path}")
+
+
+def _obj_summary(fields: dict) -> str:
+    parts: list[str] = []
+    for key in IP_FIELDS:
+        value = fields.get(key)
+        if isinstance(value, str):
+            parts.append(f"{key}: {value}")
+    mem = fields.get("member") or fields.get("members") or \
+        fields.get("static")
+    members = member_values(mem) if mem is not None else []
+    if members:
+        parts.append("members: " + ", ".join(members))
+    return "; ".join(parts)
 
 
 # --------------------------------------------------------------------------- #

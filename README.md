@@ -155,12 +155,18 @@ the **committed** running config across **all device groups and shared**:
   rule using `grp-servers` counts as using a member address object;
 - scans every security, NAT and PBR rulebase (pre-/post-rulebase included)
   in each device group;
+- always lists every matched **object name** with its type and location
+  (plus IP/member summary - handy when searching by IP address);
 - output per rule: location, rulebase, rule name, which fields referenced
   the object (directly or via a group), and the rule's from/to/source/dest/
   service/application/action.
 
-Results are written to `where-used_<query>_<timestamp>.txt|.csv|.json` in the
-current directory (and printed to the screen in text mode).
+After each search, enter another query to keep searching (`q` returns to the
+Mode menu). At the `Export results` prompt: `c` writes
+`where-used_<query>_<ts>_objects.csv` (matched objects) plus
+`where-used_<query>_<ts>_rules.csv` (rule references); `j` writes a single
+`where-used_<query>_<ts>.json` containing both. Enter skips export (results
+are always printed to the screen).
 
 Note: object resolution is by name across all device groups and shared;
 cross-device-group scoping nuances (e.g. a group with the same name in two
