@@ -27,8 +27,13 @@ Interactive flow:
 Device groups   -> pick one (number), or "(shared)" for shared objects
 Action          -> [1] list objects   [2] export CSV/JSON   [3] import CSV/JSON
                    [4] copy/move object(s) to shared   (only for device groups)
+                   [last] quit        (number varies)
 Object types    -> pick one (address, service, ...)
 ```
+
+The Action menu repeats after each action (and after import/copy/move finish),
+so you can list, export, import and convert as many times as you want per
+device group before quitting. `--output json/csv` is a one-shot export.
 
 Running with **no arguments** prints this help menu.
 

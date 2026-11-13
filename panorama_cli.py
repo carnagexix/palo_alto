@@ -56,7 +56,7 @@ OBJECT_TYPES = [
 ]
 # Order in which object types are applied so references resolve (groups
 # reference addresses/services, objects reference tags).
-BUILD = "2026-11-13a (copy/move: convert-more loop, @file name list)"
+BUILD = "2026-11-13b (action menu loops: list/export/import/convert repeatedly)"
 APPLY_ORDER = ["tag", "application", "service", "service-group", "address",
                "address-group"]
 DG_GROUPS = ("DevGroup", "DynGroup")  # static and dynamic device groups
@@ -1786,31 +1786,44 @@ def main() -> None:
     device_group = choose(groups, "Device groups")
     print(f"Selected device group: {device_group}")
 
-    # 3. Action: list, export, import, or move objects to shared.
+    # 3. Action: list, export, import, or move objects to shared. Re-offer the
+    # menu after each action so multiple actions can be run per session.
     actions = ["list objects", "export to CSV/JSON", "import from CSV/JSON file"]
     if device_group != SHARED_LABEL:
         actions.append("copy/move object(s) to shared")
-    if args.output == "text":
-        action = choose(actions, "Action")
-    else:
-        action = actions[1]
+    actions.append("quit")
 
-    if action == actions[2]:
-        import_objects(client, device_group)
-        return
+    while True:
+        if args.output == "text":
+            action = choose(actions, "Action")
+        else:
+            action = actions[1]
 
-    # 4. Object type.
-    obj_type = choose(OBJECT_TYPES, "Object types")
+        if action == "quit":
+            print("bye")
+            return
 
-    if action.startswith("copy/"):
-        copy_or_move_to_shared(client, device_group, obj_type)
-    elif action == actions[1]:
-        out_fmt = args.output
-        if out_fmt == "text":
-            out_fmt = choose(["csv", "json"], "Export format")
-        print_objects(client, device_group, obj_type, out_fmt=out_fmt)
-    else:
-        print_objects(client, device_group, obj_type)
+        if action == actions[2]:
+            import_objects(client, device_group)
+            if args.output != "text":
+                return
+            continue
+
+        # 4. Object type.
+        obj_type = choose(OBJECT_TYPES, "Object types")
+
+        if action.startswith("copy/"):
+            copy_or_move_to_shared(client, device_group, obj_type)
+        elif action == actions[1]:
+            out_fmt = args.output
+            if out_fmt == "text":
+                out_fmt = choose(["csv", "json"], "Export format")
+            print_objects(client, device_group, obj_type, out_fmt=out_fmt)
+        else:
+            print_objects(client, device_group, obj_type)
+
+        if args.output != "text":
+            return
 
 
 if __name__ == "__main__":
