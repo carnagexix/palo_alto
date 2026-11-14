@@ -304,7 +304,7 @@ and members must be JSON, e.g. `{"member": ["office", "prod"]}`):
 
 ## Authors & Credits
 
-- **carnagexix** - project owner; ran, tested, and tuned everything against
+- **qwen3.8-flash-next-unsloth-ud-iq2_xs** - project owner; ran, tested, and tuned everything against
   production Panorama.
 - **opencode** - AI coding assistant; built the object browser, where-used
   search, group/rule editing flows, exports, and diagnostics, and maintains
