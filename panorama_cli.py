@@ -56,7 +56,7 @@ OBJECT_TYPES = [
 ]
 # Order in which object types are applied so references resolve (groups
 # reference addresses/services, objects reference tags).
-BUILD = "2026-11-14-fix5 (rule updates: optional append text to rule description, shown in preview/diff/CLI; revert also restores original description)"
+BUILD = "2026-11-14-fix6 (rule description append uses space separator)"
 APPLY_ORDER = ["tag", "application", "service", "service-group", "address",
                "address-group"]
 DG_GROUPS = ("DevGroup", "DynGroup")  # static and dynamic device groups
@@ -2084,7 +2084,7 @@ def _append_desc(cur: str, suffix: str) -> str:
         return cur
     if cur.rstrip().endswith(suffix.rstrip()):
         return cur
-    return f"{cur}\n{suffix}" if cur.rstrip() else suffix
+    return f"{cur} {suffix}" if cur.rstrip() else suffix
 
 
 def _rule_desc_live(client: PanoramaClient, rec: dict) -> str:
