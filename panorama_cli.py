@@ -56,7 +56,7 @@ OBJECT_TYPES = [
 ]
 # Order in which object types are applied so references resolve (groups
 # reference addresses/services, objects reference tags).
-BUILD = "2026-11-13p (where-used: post-export action menu: [1] groups, [2] rules)"
+BUILD = "2026-11-14-fix2 (direct rule matches only; excludes group-only hits)"
 APPLY_ORDER = ["tag", "application", "service", "service-group", "address",
                "address-group"]
 DG_GROUPS = ("DevGroup", "DynGroup")  # static and dynamic device groups
@@ -219,6 +219,8 @@ class PanoramaClient:
             print(f"REQUEST {url}", file=sys.stderr)
             print(f"params: {safe}", file=sys.stderr)
             body = resp.text
+            if query.get("type") == "config" and query.get("action") in ("show", "get"):
+                body = f"[configuration XML response hidden: {len(resp.content)} bytes]"
             if len(body) > 2000:
                 body = body[:2000] + f"\n[...truncated, {len(resp.text)} bytes]"
             print(body, file=sys.stderr)
@@ -651,56 +653,81 @@ class PanoramaClient:
                 last = exc
         raise last  # type: ignore[misc]
 
+    @staticmethod
+    def _policy_resource(rulebase: str) -> str:
+        """Panorama policy endpoints differ from firewall /Policies/SecurityRules.
+
+        Example: post-rulebase/security -> /Policies/SecurityPostRules.
+        Never guess endpoints with POST: POST would create policies.
+        """
+        parts = rulebase.split("/")
+        if len(parts) != 2 or parts[0] not in ("pre-rulebase", "post-rulebase"):
+            raise RuntimeError(f"unsupported Panorama rulebase: {rulebase!r}")
+        policy_types = {
+            "security": "Security", "nat": "NAT", "qos": "QoS",
+            "pbr": "PolicyBasedForwarding", "dos": "DoS",
+            "decryption": "Decryption",
+            "application-override": "ApplicationOverride",
+            "authentication": "Authentication",
+        }
+        prefix = policy_types.get(parts[1])
+        if not prefix:
+            raise RuntimeError(f"unsupported policy type: {parts[1]!r}")
+        phase = "Pre" if parts[0] == "pre-rulebase" else "Post"
+        return f"/Policies/{prefix}{phase}Rules"
+
+    def _rule_rest_params(self, device_group: str, rule_name: str) -> dict:
+        return {**self._rest_location(device_group), "name": rule_name}
+
+    def rest_rule_get_entry(self, device_group: str, rulebase: str,
+                            rule_name: str) -> dict:
+        """Read a rule from the candidate policy API before modifying it.
+
+        Preserve the fields/metadata supplied by Panorama rather than PUTting
+        a potentially stale copy extracted from committed running config.
+        """
+        endpoint = f"{self.rest_base()}{self._policy_resource(rulebase)}"
+        data = self._rest("GET", endpoint,
+                          self._rule_rest_params(device_group, rule_name))
+        result = data.get("result") if isinstance(data.get("result"), dict) else data
+        entries = result.get("entry") if isinstance(result, dict) else None
+        if isinstance(entries, dict):
+            entries = [entries]
+        for entry in (entries if isinstance(entries, list) else []):
+            if isinstance(entry, dict) and entry.get("@name", entry.get("name")) == rule_name:
+                return entry
+        raise RuntimeError(f"REST policy GET returned no exact match for {rule_name!r}; refusing blind update")
+
     def rest_rule_update(self, device_group: str, rulebase: str,
                          rule_name: str, rule: dict) -> dict:
-        """Update one rule via the modern REST API, probing the endpoint and
-        method this build exposes, then caching the working route.
-
-        rulebase is e.g. 'rulebase/security' or 'pre-rulebase/nat'; the rule
-        dict is the full (merged) rule body read from the running config.
-        The per-type resources (/Rules/Security, /Rules/Nat, ...) are the
-        documented 11.x routes; plain /Rules is tried as a fallback."""
-        kind = rulebase.split("/")[0]
-        rtype = rulebase.split("/")[-1] if "/" in rulebase else "security"
-        type_seg = {"security": "Security", "nat": "Nat", "pbr": "Pbr",
-                    "dos": "Dos"}.get(rtype.lower(), rtype.capitalize())
-        loc = self._rest_location(device_group)
-        params = {**loc, "rulebase": kind, "name": rule_name}
-        if device_group != SHARED_LABEL:
-            params["panorama"] = "LocalDevice"
+        """Update an existing candidate rule with documented Panorama PUT."""
+        endpoint = f"{self.rest_base()}{self._policy_resource(rulebase)}"
         entry = {k: v for k, v in rule.items() if k != "name"}
         entry["@name"] = rule_name
-        entry["@rulebase"] = kind
-        body = {"entry": [entry]}
-        cached = getattr(self, "_rules_route", None)
-        if isinstance(cached, tuple):
-            path, method = cached
-            return self._rest(method, path, params, body)
-        if cached is False:
-            raise RuntimeError(getattr(self, "_rules_err",
-                                       "no supported REST rules endpoint"))
-        last: RuntimeError | None = None
-        bases = [self.rest_base()]
-        alt = bases[0].replace("/v11.", "/v12.")
-        if alt != bases[0]:
-            bases.append(alt)
-        for base in bases:
-            for endpoint in (f"/Rules/{type_seg}",
-                             f"/{type_seg}Rules",
-                             f"/Objects/{type_seg}Rules",
-                             f"/Objects/Rules/{type_seg}",
-                             "/Rules"):
-                for method in ("POST", "PUT"):
-                    try:
-                        data = self._rest(method, f"{base}{endpoint}",
-                                          params, body)
-                        self._rules_route = (f"{base}{endpoint}", method)
-                        return data
-                    except RuntimeError as exc:
-                        last = exc
-        self._rules_route = False
-        self._rules_err = str(last or "no REST rules endpoint")
-        raise last  # type: ignore[misc]
+        entry["@location"] = "shared" if device_group == SHARED_LABEL else "device-group"
+        if device_group != SHARED_LABEL:
+            entry["@device-group"] = device_group
+        entry.pop("@rulebase", None)  # the URI selects pre or post rules
+        return self._rest("PUT", endpoint,
+                          self._rule_rest_params(device_group, rule_name),
+                          {"entry": [entry]})
+
+    def config_rule_field_read(self, path: str, field: str) -> list[str] | None:
+        """Read a specific candidate XML field; None means unavailable."""
+        result = self._request({"type": "config", "action": "get", "xpath": path})
+        if isinstance(result, dict) and field in result:
+            return member_values(result[field])
+        return None
+
+    def config_rule_field_edit(self, path: str, field: str,
+                               members: list[str]):
+        """Standard XML API edit at a known, existing field XPath."""
+        url = f"https://{self.host}/api/"
+        data = {"type": "config", "action": "edit", "key": self.api_key,
+                "xpath": path, "element": xml_value(field, {"member": members})}
+        resp = self.session.post(url, data=data, timeout=self.timeout,
+                                 verify=False)
+        return self._handle_response(resp, url, data)
 
     def rest_commit(self, description: str) -> dict:
         base = self.rest_base()
@@ -1058,17 +1085,22 @@ def dg_set_paths(device_group: str, obj_type: str, name: str) -> list[str]:
 
 def rule_field_paths(device_group: str, rulebase: str, rule_name: str,
                      field: str) -> list[str]:
-    """XML-API set paths for one rule field (source/destination/...)."""
+    """Valid Panorama XML rule-field XPaths (candidate config hierarchy)."""
+    if field not in ("source", "destination"):
+        raise ValueError(f"unsupported member field {field!r}")
+    if not (rulebase.startswith("pre-rulebase/") or
+            rulebase.startswith("post-rulebase/")):
+        raise ValueError(f"unexpected rulebase {rulebase!r}")
     q = xpath_quote(rule_name)
+    suffix = f"/{rulebase}/rules/entry[@name='{q}']/{field}"
     if device_group == SHARED_LABEL:
-        root = "/shared"
-    else:
-        root = ("/devices/LocalDevice/device-group/DevGroup/"
-                f"entry[@name='{xpath_quote(device_group)}']")
-    return [f"{root}/rules/{rulebase}/name/{q}/{field}",
-            f"{root}/rules/{rulebase}/entry[@name='{q}']/{field}",
-            f"/devices/LocalDevice/rulebase/{rulebase}/rules/entry[@name='{q}']/{field}"]
-
+        return [f"/config/shared{suffix}"]
+    dg = xpath_quote(device_group)
+    # Documented Panorama XML configuration hierarchy.
+    return [
+        "/config/devices/entry[@name='localhost.localdomain']"
+        f"/device-group/entry[@name='{dg}']{suffix}",
+    ]
 
 def read_import_file(path: str) -> dict[str, list[dict]]:
     """Group entries in a CSV/JSON file by object type.
@@ -1641,13 +1673,21 @@ def _where_used_once(client: PanoramaClient, locations: list[str],
         if not isinstance(container, dict):
             continue
         for rule, rb in iter_rules(container):
+            # Keep indirect/group hits for where-used reporting, but track
+            # *direct* field matches separately for the rule editor.  A rule
+            # whose source contains only an address-group wrapping the sought
+            # address must NEVER be selected for a rule update.
             matched: dict[str, list[str]] = {}
+            direct_matched: dict[str, list[str]] = {}
             for field, value in rule.items():
                 if field == "name":
                     continue
                 for member in member_values(value):
-                    if member.lower() in hits:
+                    ml = member.lower()
+                    if ml in hits:
                         matched.setdefault(field, []).append(member)
+                        if ml in direct:
+                            direct_matched.setdefault(field, []).append(member)
             if not matched:
                 continue
             rec = {"location": loc, "rulebase": rb,
@@ -1671,7 +1711,8 @@ def _where_used_once(client: PanoramaClient, locations: list[str],
                 f"{f}: {'|'.join(ms)}" for f, ms in matched.items())
             rec["matched_objects"] = ", ".join(dict.fromkeys(matched_objs))
             rec["indirectly_via"] = "; ".join(dict.fromkeys(via_notes))
-            rec["_fields"] = sorted(matched)
+            rec["_fields"] = sorted(matched)  # includes indirect hits for reporting
+            rec["_direct_fields"] = sorted(direct_matched)  # only edit these
             rec["_rule"] = rule
             rec["_rb"] = rb
             records.append(rec)
@@ -1782,9 +1823,13 @@ def _where_used_once(client: PanoramaClient, locations: list[str],
         print("\nNext action:")
         print("  [1] add/modify address groups that use this object"
               + ("" if editable_groups else "  (no address groups found)"))
-        print("  [2] add address/address-group objects to existing rules "
-              "that use this object" + ("" if records else
-                                        "  (no rule references)"))
+        print("  [2] add address/address-group objects to rules "
+              "DIRECTLY containing the matched object(s) "
+              "(exclude matches via groups)" +
+              ("" if any(any(f in ("source", "destination")
+                             for f in rec.get("_direct_fields", ()))
+                         for rec in records)
+               else "  (no direct source/destination references)"))
         sel = input("Select number (Enter=skip): ").strip()
         if sel == "1":
             if editable_groups:
@@ -1989,8 +2034,21 @@ def _revert_group_changes(client: PanoramaClient, query: str, plan: list,
 
 def _add_to_rules(client: PanoramaClient, objects: dict, records: list,
                   query: str = "") -> None:
-    """Append address/address-group members to the rule fields (source /
-    destination) where the searched object was actually found."""
+    """Append members only to fields DIRECTLY containing the searched object.
+
+    Indirect where-used results (a rule referencing a group that contains a
+    matched object) are visible in the report but must never be modified.
+    _direct_fields comes from _where_used_once and is deliberately required;
+    falling back to _fields would silently re-enable indirect edits.
+    """
+    if not any(any(f in ("source", "destination")
+                   for f in rec.get("_direct_fields", ()))
+               for rec in records):
+        print("No rules directly reference the searched object in their "
+              "source or destination fields. Indirect matches through "
+              "groups are excluded from rule updates.")
+        return
+
     adds = _prompt_add_names(objects)
     if adds is None:
         return
@@ -1998,12 +2056,16 @@ def _add_to_rules(client: PanoramaClient, objects: dict, records: list,
     plan, skipped, seen_plan = [], [], set()
     for rec in records:
         rule, rb = rec["_rule"], rec["_rb"]
-        hit_fields = [f for f in rec.get("_fields", [])
+        hit_fields = [f for f in rec.get("_direct_fields", ())
                       if f in ("source", "destination")]
         if not hit_fields:
-            skipped.append(f"[{rb}] {rec['location']}/{rec['rule']}: object "
-                           "referenced only in non-address field(s) "
-                           f"({', '.join(rec.get('_fields') or ['?'])})")
+            if any(f in ("source", "destination")
+                   for f in rec.get("_fields", ())):
+                note = "indirect match through an object group only"
+            else:
+                note = "direct match not in source/destination"
+            skipped.append(f"[{rb}] {rec['location']}/{rec['rule']}: "
+                           f"{note}; rule unchanged")
             continue
         for fld in hit_fields:
             key = (rec["location"], rb, rec["rule"], fld)
@@ -2056,9 +2118,8 @@ def _add_to_rules(client: PanoramaClient, objects: dict, records: list,
     for name, err in failed[:5]:
         print(f"  FAILED {name}: {err}", file=sys.stderr)
     if failed:
-        if getattr(client, "_rule_write_unsupported", False):
-            print("NOTE: this Panorama build accepts no API rule writes; "
-                  "a CLI script was generated instead.", file=sys.stderr)
+        print("NOTE: API rule writes failed; generated reviewable, "
+              "append-only Panorama CLI commands.", file=sys.stderr)
         cli_path, cli_text = _rule_cli_script(query, plan, statuses)
         Path(cli_path).write_text(cli_text, encoding="utf-8")
         print(f"CLI fallback script saved to {cli_path}")
@@ -2078,93 +2139,93 @@ def _add_to_rules(client: PanoramaClient, objects: dict, records: list,
             _revert_rule_changes(client, query, plan, statuses)
 
 
-def _partial_rule_subtree(rec: dict, fld: str, new_val) -> list[str]:
-    """Candidate load/config/partial subtrees for one rule field, ordered
-    by most likely accepted root: full <devices> mirror first (the
-    serialized config tree), then bare container roots."""
-    def q(v):
-        return escape(str(v), {'"': "&quot;"})
-    body = xml_value(fld, new_val)
-    entry = f"<entry name=\"{q(rec['rule'])}\">{body}</entry>"
-    xml = f"<rules>{entry}</rules>"
-    for seg in reversed(str(rec["_rb"]).split("/")):
-        xml = f"<{seg}>{xml}</{seg}>"
-    xml = f"<rules>{xml}</rules>"
-    if rec["location"] == SHARED_LABEL:
-        return [f"<shared>{xml}</shared>",
-                f"<devices><entry name=\"LocalDevice\"><shared>{xml}"
-                f"</shared></entry></devices>"]
-    dg = (f"<device-group><entry name=\"{q(rec['location'])}\">{xml}"
-          f"</entry></device-group>")
-    return [f"<devices><entry name=\"LocalDevice\">{dg}</entry></devices>",
-            dg]
-
-
 def _rule_cli_script(query: str, plan: list,
                      statuses: list[tuple[str, str]]) -> tuple[str, str]:
-    """CLI 'set' lines (Panorama config mode) for the fields that failed."""
+    """Append-only Panorama CLI fallback for failed API rule edits."""
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     path = safe_filename("where-used", f"{query}_rule-edit-cli_{ts}", "txt")
-    lines = [f"! Panorama CLI to apply the rule changes for query '{query}'",
-             "! on the Panorama CLI: 'configure', paste these lines, then "
-             "'commit'", ""]
-    for (rec, fld, _m, _o, new_val, _t), (st, _e) in zip(plan, statuses):
+    lines = [f"! Panorama candidate configuration commands for query {query!r}",
+             "! Review in Panorama: 'configure', paste set commands,",
+             "! inspect the diff, then commit/push separately.",
+             "! No 'clear' commands: preserve all existing policy members.", ""]
+    for (rec, fld, _m, _o, _new_val, to_add), (st, _e) in zip(plan, statuses):
         if st == "UPDATED":
             continue
         rb = str(rec["_rb"]).replace("/", " ")
         tgt = ("shared" if rec["location"] == SHARED_LABEL
-               else f"device-group {rec['location']}")
-        q = "'" + str(rec["rule"]).replace("'", "''") + "'"
-        lines.append(f"clear {tgt} {rb} rules {q} {fld} member")
-        for m in member_values(new_val):
-            lines.append(f"set {tgt} {rb} rules {q} {fld} member "
-                         f"'{str(m).replace(chr(39), chr(39) * 2)}'")
+               else f"device-group {json.dumps(rec['location'])}")
+        name = json.dumps(rec["rule"])
+        for member in to_add:
+            lines.append(f"set {tgt} {rb} rules {name} {fld} {json.dumps(member)}")
         lines.append("")
     return path, "\n".join(lines)
 
-
 def _write_rule_field(client: PanoramaClient, rec: dict, fld: str,
-                      new_val) -> tuple[bool, str]:
-    """Set one rule field: XML config-set paths, then op load/partial,
-    then the REST rules endpoint. Short-circuits once the build is known
-    to reject every rule-write path."""
-    if getattr(client, "_rule_write_unsupported", False):
-        return False, getattr(client, "_rule_write_reason",
-                              "no supported rule-write path on this build")
+                      new_val, expected_current: list[str] | None = None
+                      ) -> tuple[bool, str]:
+    """Append new members without clobbering concurrent candidate edits.
+
+    For a revert, expected_current is the precise member list we wrote.
+    If the rule changed since that write, refuse to overwrite other edits.
+    """
     loc, rb, rname = rec["location"], rec["_rb"], rec["rule"]
-    errs: list[str] = []
-    element = xml_value(fld, new_val)
-    err = ""
+    baseline = member_values(rec["_rule"].get(fld))
+    wanted = member_values(new_val)
+    if not wanted or not baseline:
+        return False, "rule has no explicit address member list"
+    extra = [m for m in wanted if m.lower() not in {b.lower() for b in baseline}]
+    errors: list[str] = []
+
+    def merge(current: list[str]) -> list[str]:
+        if not current or any(m.lower() == "any" for m in current):
+            raise RuntimeError("rule uses 'any' or has no member list; refusing modification")
+        if expected_current is not None:
+            if current != expected_current:
+                raise RuntimeError("candidate rule changed since update; refusing unsafe revert")
+            return wanted
+        present = {m.lower() for m in current}
+        if not all(m.lower() in present for m in baseline):
+            raise RuntimeError("candidate rule changed since search; search again before editing")
+        return current + [m for m in extra if m.lower() not in present]
+
+    # Preferred: fetch actual candidate rule, update only the target field,
+    # and PUT the fully populated, current policy through the correct endpoint.
+    try:
+        live = client.rest_rule_get_entry(loc, rb, rname)
+        current = member_values(live.get(fld))
+        updated = merge(current)
+        if updated == current:
+            return True, ""
+        body = dict(live)
+        body[fld] = {"member": updated}
+        client.rest_rule_update(loc, rb, rname, body)
+        # Do not try another write route following an accepted PUT.
+        return True, ""
+    except RuntimeError as exc:
+        errors.append(f"REST policy: {exc}")
+        # A stale state is a hard stop, not a trigger for another write method.
+        if any(marker in str(exc) for marker in (
+                "candidate rule changed", "refusing blind update",
+                "rule uses 'any'", "no member list")):
+            return False, "; ".join(errors)
+
+    # Fallback: read the candidate field via the XML API, then edit *only*
+    # the field. Do not attempt invalid op load/config/partial or blind sets.
     for path in rule_field_paths(loc, rb, rname, fld):
         try:
-            client.config_set(path, element)
+            current = client.config_rule_field_read(path, fld)
+            if current is None:
+                continue
+            updated = merge(current)
+            if updated == current:
+                return True, ""
+            client.config_rule_field_edit(path, fld, updated)
             return True, ""
         except RuntimeError as exc:
-            err = str(exc)
-    errs.append(f"XML: {err}")
-    try:
-        client.op_partial_config_load(_partial_rule_subtree(rec, fld,
-                                                            new_val))
-        return True, ""
-    except RuntimeError as exc:
-        errs.append(f"op partial-load: {exc}")
-    full_rule = {k: v for k, v in rec["_rule"].items() if k != "name"}
-    full_rule[fld] = new_val
-    try:
-        client.rest_rule_update(loc, rb, rname, full_rule)
-        return True, ""
-    except RuntimeError as exc:
-        errs.append(f"REST rules: {exc}")
-    reason = "; ".join(errs)
-    if ("code 16" in reason and any(m in reason for m in (
-            "Route Not Found", "HTTP 501", "Version Not Supported"))):
-        client._rule_write_unsupported = True
-        client._rule_write_reason = (
-            "this Panorama build exposes no rule-write path (XML config set: "
-            "unauth code 16; op load/partial refused; REST rules routes "
-            "return 501 Route Not Found)")
-    return False, reason
-
+            errors.append(f"XML {path}: {exc}")
+            if "candidate rule changed" in str(exc) or "refusing" in str(exc):
+                return False, "; ".join(errors)
+    return False, "; ".join(errors) or "Could not read candidate policy rule"
 
 def _rule_edit_diff(query: str, adds: list[str], entries: list[tuple],
                     statuses: list[tuple[str, str]], phase: str,
@@ -2209,7 +2270,8 @@ def _revert_rule_changes(client: PanoramaClient, query: str,
         return
     ok, rstatus = 0, []
     for rec, fld, _before, orig_val, _add in entries:
-        good, err = _write_rule_field(client, rec, fld, orig_val)
+        good, err = _write_rule_field(client, rec, fld, orig_val,
+                                      expected_current=_before)
         rstatus.append(("REVERTED", "") if good else ("FAILED", err))
         ok += 1 if good else 0
     print(f"\nReverted {ok}/{len(entries)} rule field(s) to their original "
