@@ -177,7 +177,8 @@ After export, an **action menu** appears when there is anything to edit:
 ```
 Next action:
   [1] add/modify address groups that use this object
-  [2] add address/address-group objects to rules directly containing this object
+  [2] add address/address-group objects to rules DIRECTLY containing
+      the matched object(s) (group-mediated rule hits are excluded)
 Select number (Enter=skip):
 ```
 
@@ -208,17 +209,24 @@ preview, then type `yes` to apply. The diff
 before/after, and added members. The post-update menu provides **commit**,
 **revert these rule changes**, or **leave pending**.
 
-Rule writes use the Panorama policies REST endpoints
-(`/restapi/v11.0/Policies/SecurityPreRules` and
-`/restapi/v11.0/Policies/SecurityPostRules` for security rules), with
-XML configuration API fallbacks. The updater reads the current candidate rule
-before modifying its member list to retain existing/pending values and
-checks the result. If the server rejects policy API writes, the tool
-generates a CLI fallback script
-(`where-used_<query>_rule-edit-cli_<ts>.txt`) using append-only `set`
-operations instead of clearing the existing list. Check the reported API
-error and permissions if writes fail; `--diagnose` can help investigate.
-**Test on a noncritical rule and review the candidate diff before committing.**
+**How rule writes work on Panorama (verified on 12.1.10-h3).**
+The `/restapi/v11.0/Rules/...`, `/Rules/Security` and similar routes
+all return `501 Route Not Found` - those are wrong. The actual Panorama REST
+policy resources are **`/restapi/v11.0/Policies/SecurityPreRules` and
+`.../Policies/SecurityPostRules`** (`NatPreRules`/`NatPostRules`, etc.),
+addressed with `location` + `device-group` + `name` params and updated with
+`PUT` (never `POST` - POST would create policies). The script first GETs the
+live candidate rule, merges only the target field's members, and PUTs the
+whole current entry, so concurrent edits are never clobbered and a stale
+read aborts the revert. The XML-API fallback uses the real Panorama config
+tree device name **`localhost.localdomain`** (not `LocalDevice`):
+`/config/devices/entry[@name='localhost.localdomain']/device-group/entry[...]/post-rulebase/security/rules/entry[...]/source`,
+reading via `action=get` then replacing the field with `action=edit`.
+If both fail, an **append-only CLI fallback**
+(`where-used_<query>_rule-edit-cli_<ts>.txt`) is written with
+`set ... <field> member "<name>"` lines (no `clear` commands, so existing
+members are preserved); paste into `configure`, review the candidate diff,
+then commit. **Test on a noncritical rule first.**
 
 Note: object resolution is by name across all device groups and shared;
 cross-device-group scoping nuances (e.g. a group with the same name in two

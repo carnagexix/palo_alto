@@ -56,7 +56,7 @@ OBJECT_TYPES = [
 ]
 # Order in which object types are applied so references resolve (groups
 # reference addresses/services, objects reference tags).
-BUILD = "2026-11-14-fix2 (direct rule matches only; excludes group-only hits)"
+BUILD = "2026-11-14-fix3 (rule writes via /Policies/Security{Pre,Post}Rules PUT + localhost.localdomain XML edit; direct matches only; CLI fallback member fix)"
 APPLY_ORDER = ["tag", "application", "service", "service-group", "address",
                "address-group"]
 DG_GROUPS = ("DevGroup", "DynGroup")  # static and dynamic device groups
@@ -2156,7 +2156,8 @@ def _rule_cli_script(query: str, plan: list,
                else f"device-group {json.dumps(rec['location'])}")
         name = json.dumps(rec["rule"])
         for member in to_add:
-            lines.append(f"set {tgt} {rb} rules {name} {fld} {json.dumps(member)}")
+            lines.append(f"set {tgt} {rb} rules {name} {fld} member "
+                         f"{json.dumps(member)}")
         lines.append("")
     return path, "\n".join(lines)
 
@@ -2211,7 +2212,12 @@ def _write_rule_field(client: PanoramaClient, rec: dict, fld: str,
 
     # Fallback: read the candidate field via the XML API, then edit *only*
     # the field. Do not attempt invalid op load/config/partial or blind sets.
-    for path in rule_field_paths(loc, rb, rname, fld):
+    try:
+        paths = rule_field_paths(loc, rb, rname, fld)
+    except ValueError as exc:
+        errors.append(f"XML: {exc}")
+        return False, "; ".join(errors)
+    for path in paths:
         try:
             current = client.config_rule_field_read(path, fld)
             if current is None:
