@@ -56,7 +56,7 @@ OBJECT_TYPES = [
 ]
 # Order in which object types are applied so references resolve (groups
 # reference addresses/services, objects reference tags).
-BUILD = "2026-11-14-fix4 (menu [1] only for matched address groups: add/remove members via submenu; file/single/multiple names)"
+BUILD = "2026-11-14-fix5 (rule updates: optional append text to rule description, shown in preview/diff/CLI; revert also restores original description)"
 APPLY_ORDER = ["tag", "application", "service", "service-group", "address",
                "address-group"]
 DG_GROUPS = ("DevGroup", "DynGroup")  # static and dynamic device groups
@@ -725,6 +725,16 @@ class PanoramaClient:
         url = f"https://{self.host}/api/"
         data = {"type": "config", "action": "edit", "key": self.api_key,
                 "xpath": path, "element": xml_value(field, {"member": members})}
+        resp = self.session.post(url, data=data, timeout=self.timeout,
+                                 verify=False)
+        return self._handle_response(resp, url, data)
+
+    def config_rule_desc_edit(self, rule_xpath: str, text: str):
+        """Replace a rule's description through the XML config API."""
+        url = f"https://{self.host}/api/"
+        data = {"type": "config", "action": "edit", "key": self.api_key,
+                "xpath": f"{rule_xpath}/description",
+                "element": f"<description>{escape(text)}</description>"}
         resp = self.session.post(url, data=data, timeout=self.timeout,
                                  verify=False)
         return self._handle_response(resp, url, data)
@@ -2067,6 +2077,28 @@ def _revert_group_changes(client: PanoramaClient, query: str, plan: list,
             commit_changes(client)
 
 
+def _append_desc(cur: str, suffix: str) -> str:
+    """Append suffix to a rule description; idempotent when already present."""
+    cur = cur if isinstance(cur, str) else str(cur or "")
+    if cur.strip() and cur.rstrip() == suffix.rstrip():
+        return cur
+    if cur.rstrip().endswith(suffix.rstrip()):
+        return cur
+    return f"{cur}\n{suffix}" if cur.rstrip() else suffix
+
+
+def _rule_desc_live(client: PanoramaClient, rec: dict) -> str:
+    """Current description of a rule: prefer the live REST candidate value,
+    falling back to the value seen during the where-used scan."""
+    try:
+        live = client.rest_rule_get_entry(rec["location"], rec["_rb"],
+                                          rec["rule"])
+        desc = live.get("description", "")
+    except RuntimeError:
+        desc = rec["_rule"].get("description", "")
+    return desc if isinstance(desc, str) else str(desc or "")
+
+
 def _add_to_rules(client: PanoramaClient, objects: dict, records: list,
                   query: str = "") -> None:
     """Append members only to fields DIRECTLY containing the searched object.
@@ -2132,17 +2164,42 @@ def _add_to_rules(client: PanoramaClient, objects: dict, records: list,
         return
 
     print(f"\nWill update {len(plan)} rule field(s):")
+
+    rule_keys = dict.fromkeys(
+        (rec["location"], rec["_rb"], rec["rule"])
+        for rec, _f, _m, _o, _n, _t in plan)
+    suffix = input("\nOptional text to append to these rules' descriptions "
+                   "(Enter=skip): ").strip()
+    desc_map: dict[tuple, tuple[str, str]] = {}
+    for key in rule_keys:
+        rec = next(r for r, _f, _m, _o, _n, _t in plan
+                   if (r["location"], r["_rb"], r["rule"]) == key)
+        orig = _rule_desc_live(client, rec)
+        desc_map[key] = (orig, _append_desc(orig, suffix) if suffix else orig)
+
+    seen_desc = set()
     for rec, fld, members, _orig, new_val, _to_add in plan:
         print(f"  [{rec['_rb']}] {rec['location']}/{rec['rule']}")
         print(f"    before: {fld}: {' | '.join(members)}")
         print(f"    after : {fld}: {' | '.join(member_values(new_val))}")
+        key = (rec["location"], rec["_rb"], rec["rule"])
+        if key not in seen_desc:
+            seen_desc.add(key)
+            orig, new = desc_map[key]
+            print(f"    desc  : {orig!r}")
+            if new != orig:
+                print(f"    desc+ : {new!r}")
     if input("Type 'yes' to update these rules: ").strip().lower() != "yes":
         print("Rule update cancelled.")
         return
 
     ok, failed, statuses = 0, [], []
     for rec, fld, _members, _orig, new_val, _to_add in plan:
-        good, err = _write_rule_field(client, rec, fld, new_val)
+        key = (rec["location"], rec["_rb"], rec["rule"])
+        orig_d, new_d = desc_map[key]
+        good, err = _write_rule_field(
+            client, rec, fld, new_val,
+            desc_new=(new_d if new_d != orig_d else None))
         if good:
             statuses.append(("UPDATED", ""))
             ok += 1
@@ -2155,14 +2212,15 @@ def _add_to_rules(client: PanoramaClient, objects: dict, records: list,
     if failed:
         print("NOTE: API rule writes failed; generated reviewable, "
               "append-only Panorama CLI commands.", file=sys.stderr)
-        cli_path, cli_text = _rule_cli_script(query, plan, statuses)
+        cli_path, cli_text = _rule_cli_script(query, plan, statuses, desc_map)
         Path(cli_path).write_text(cli_text, encoding="utf-8")
         print(f"CLI fallback script saved to {cli_path}")
 
     diff_entries = [(rec, fld, members, new_val, to_add)
                     for rec, fld, members, _o, new_val, to_add in plan]
     diff_path, diff_text = _rule_edit_diff(query, adds, diff_entries,
-                                           statuses, "applied", "rule-edit")
+                                           statuses, "applied", "rule-edit",
+                                           desc_map=desc_map)
     _move_print_diff(diff_text, diff_path)
     if ok:
         actions = ["commit changes (optional description)",
@@ -2171,11 +2229,11 @@ def _add_to_rules(client: PanoramaClient, objects: dict, records: list,
         if action == actions[0]:
             commit_changes(client)
         elif action == actions[1]:
-            _revert_rule_changes(client, query, plan, statuses)
+            _revert_rule_changes(client, query, plan, statuses, desc_map)
 
 
-def _rule_cli_script(query: str, plan: list,
-                     statuses: list[tuple[str, str]]) -> tuple[str, str]:
+def _rule_cli_script(query: str, plan: list, statuses: list[tuple[str, str]],
+                     desc_map: dict | None = None) -> tuple[str, str]:
     """Append-only Panorama CLI fallback for failed API rule edits."""
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     path = safe_filename("where-used", f"{query}_rule-edit-cli_{ts}", "txt")
@@ -2183,6 +2241,7 @@ def _rule_cli_script(query: str, plan: list,
              "! Review in Panorama: 'configure', paste set commands,",
              "! inspect the diff, then commit/push separately.",
              "! No 'clear' commands: preserve all existing policy members.", ""]
+    done_desc = set()
     for (rec, fld, _m, _o, _new_val, to_add), (st, _e) in zip(plan, statuses):
         if st == "UPDATED":
             continue
@@ -2193,16 +2252,25 @@ def _rule_cli_script(query: str, plan: list,
         for member in to_add:
             lines.append(f"set {tgt} {rb} rules {name} {fld} member "
                          f"{json.dumps(member)}")
+        key = (rec["location"], rec["_rb"], rec["rule"])
+        if desc_map and key in desc_map and key not in done_desc:
+            orig, new = desc_map[key]
+            if new != orig:
+                done_desc.add(key)
+                lines.append(f"set {tgt} {rb} rules {name} description "
+                             f"{json.dumps(new)}")
         lines.append("")
     return path, "\n".join(lines)
 
 def _write_rule_field(client: PanoramaClient, rec: dict, fld: str,
-                      new_val, expected_current: list[str] | None = None
+                      new_val, expected_current: list[str] | None = None,
+                      desc_new: str | None = None
                       ) -> tuple[bool, str]:
     """Append new members without clobbering concurrent candidate edits.
 
     For a revert, expected_current is the precise member list we wrote.
     If the rule changed since that write, refuse to overwrite other edits.
+    desc_new (when given) replaces the rule description in the same update.
     """
     loc, rb, rname = rec["location"], rec["_rb"], rec["rule"]
     baseline = member_values(rec["_rule"].get(fld))
@@ -2224,16 +2292,21 @@ def _write_rule_field(client: PanoramaClient, rec: dict, fld: str,
             raise RuntimeError("candidate rule changed since search; search again before editing")
         return current + [m for m in extra if m.lower() not in present]
 
-    # Preferred: fetch actual candidate rule, update only the target field,
-    # and PUT the fully populated, current policy through the correct endpoint.
+    # Preferred: fetch actual candidate rule, update only the target field
+    # and description, and PUT the fully populated, current policy.
     try:
         live = client.rest_rule_get_entry(loc, rb, rname)
         current = member_values(live.get(fld))
         updated = merge(current)
-        if updated == current:
+        live_desc = live.get("description", "")
+        live_desc = live_desc if isinstance(live_desc, str) else str(live_desc or "")
+        desc_changed = desc_new is not None and live_desc != desc_new
+        if updated == current and not desc_changed:
             return True, ""
         body = dict(live)
         body[fld] = {"member": updated}
+        if desc_new is not None:
+            body["description"] = desc_new
         client.rest_rule_update(loc, rb, rname, body)
         # Do not try another write route following an accepted PUT.
         return True, ""
@@ -2246,7 +2319,7 @@ def _write_rule_field(client: PanoramaClient, rec: dict, fld: str,
             return False, "; ".join(errors)
 
     # Fallback: read the candidate field via the XML API, then edit *only*
-    # the field. Do not attempt invalid op load/config/partial or blind sets.
+    # the field (and description if requested).
     try:
         paths = rule_field_paths(loc, rb, rname, fld)
     except ValueError as exc:
@@ -2258,10 +2331,19 @@ def _write_rule_field(client: PanoramaClient, rec: dict, fld: str,
             if current is None:
                 continue
             updated = merge(current)
-            if updated == current:
-                return True, ""
-            client.config_rule_field_edit(path, fld, updated)
-            return True, ""
+            field_changed = updated != current
+            if field_changed:
+                client.config_rule_field_edit(path, fld, updated)
+            desc_note = ""
+            if desc_new is not None:
+                try:
+                    client.config_rule_desc_edit(path.rsplit("/", 1)[0],
+                                                 desc_new)
+                except RuntimeError as exc:
+                    desc_note = f" (description edit failed: {exc})"
+            if field_changed or not desc_note:
+                return True, desc_note
+            errors.append(f"XML {path}: field unchanged and description edit failed")
         except RuntimeError as exc:
             errors.append(f"XML {path}: {exc}")
             if "candidate rule changed" in str(exc) or "refusing" in str(exc):
@@ -2270,7 +2352,8 @@ def _write_rule_field(client: PanoramaClient, rec: dict, fld: str,
 
 def _rule_edit_diff(query: str, adds: list[str], entries: list[tuple],
                     statuses: list[tuple[str, str]], phase: str,
-                    suffix: str) -> tuple[str, str]:
+                    suffix: str, desc_map: dict | None = None
+                    ) -> tuple[str, str]:
     """entries: (rec, field, before_members, after_value, added_list)."""
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     path = safe_filename("where-used", f"{query}_{suffix}_{ts}", "txt")
@@ -2283,6 +2366,7 @@ def _rule_edit_diff(query: str, adds: list[str], entries: list[tuple],
               f"(source/destination member lists before -> after)\n"
               + "=" * 60 + "\n\n")
     body = []
+    seen_desc = set()
     for (rec, fld, before, after_val, to_add), (status, err) in \
             zip(entries, statuses):
         body.append(f"[{status}] [{rec['_rb']}] "
@@ -2292,6 +2376,13 @@ def _rule_edit_diff(query: str, adds: list[str], entries: list[tuple],
                     f"{' | '.join(member_values(after_val))}")
         if to_add:
             body.append(f"  + added : {fld}: {', '.join(to_add)}")
+        key = (rec["location"], rec["_rb"], rec["rule"])
+        if desc_map and key in desc_map and key not in seen_desc:
+            seen_desc.add(key)
+            orig, new = desc_map[key]
+            if new != orig:
+                body.append(f"  - desc  : {orig!r}")
+                body.append(f"  + desc  : {new!r}")
         if err:
             body.append(f"  ! {err}")
         body.append("")
@@ -2301,24 +2392,32 @@ def _rule_edit_diff(query: str, adds: list[str], entries: list[tuple],
 
 
 def _revert_rule_changes(client: PanoramaClient, query: str,
-                         plan: list, statuses: list) -> None:
-    """Restore original member lists for the rule fields that were updated."""
+                         plan: list, statuses: list,
+                         desc_map: dict | None = None) -> None:
+    """Restore original member lists (and descriptions) for the rule fields
+    that were updated."""
     entries = [(rec, fld, member_values(new_val), orig_val, [])
                for (rec, fld, _m, orig_val, new_val, _t), (st, _e)
                in zip(plan, statuses) if st == "UPDATED"]
     if not entries:
         print("Nothing to revert (no rule changes applied).")
         return
+    revert_map = {k: (n, o) for k, (o, n) in (desc_map or {}).items()
+                  if n != o}
     ok, rstatus = 0, []
     for rec, fld, _before, orig_val, _add in entries:
+        key = (rec["location"], rec["_rb"], rec["rule"])
+        orig_d = revert_map.get(key, (None, None))[1]
         good, err = _write_rule_field(client, rec, fld, orig_val,
-                                      expected_current=_before)
+                                      expected_current=_before,
+                                      desc_new=orig_d)
         rstatus.append(("REVERTED", "") if good else ("FAILED", err))
         ok += 1 if good else 0
     print(f"\nReverted {ok}/{len(entries)} rule field(s) to their original "
           "members.")
     diff_path, diff_text = _rule_edit_diff(query, [], entries, rstatus,
-                                           "reverted", "rule-revert")
+                                           "reverted", "rule-revert",
+                                           desc_map=revert_map)
     _move_print_diff(diff_text, diff_path)
     if ok:
         actions = ["commit changes (optional description)", "leave pending"]

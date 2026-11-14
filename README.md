@@ -210,11 +210,17 @@ Enter names comma-separated, or `@file.txt` with one name per line. Names
 that do not exist (or are not address/address-group objects) are warned about
 and skipped. Members are appended to the **same directly matched field**
 (`source` or `destination`); fields containing `any` are skipped and
-existing members are not duplicated. Review the per-field before/after
-preview, then type `yes` to apply. The diff
-(`where-used_<query>_rule-edit_<ts>.txt`) records `UPDATED`/`FAILED`,
-before/after, and added members. The post-update menu provides **commit**,
-**revert these rule changes**, or **leave pending**.
+existing members are not duplicated. Optionally enter **text to append to
+the rules' descriptions** (Enter=skip): the current description of every
+rule in the plan is shown (`desc  : ...`) together with the resulting text
+(`desc+ : ...`); the append is idempotent (already-present text is not
+duplicated). Review the per-field before/after preview, then type `yes` to
+apply. The diff (`where-used_<query>_rule-edit_<ts>.txt`) records
+`UPDATED`/`FAILED`, before/after, added members, and `- desc` / `+ desc`
+changes. The post-update menu provides **commit**, **revert these rule
+changes** (restores members **and removes the appended description text**),
+or **leave pending**. If the API write fails, the CLI fallback script
+includes the `set ... description "<new text>"` line as well.
 
 **How rule writes work on Panorama (verified on 12.1.10-h3).**
 The `/restapi/v11.0/Rules/...`, `/Rules/Security` and similar routes
