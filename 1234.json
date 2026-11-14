@@ -1,0 +1,64 @@
+{
+  "address": [
+    {
+      "name": "test1234",
+      "description": "test1234",
+      "ip-netmask": "1.2.3.4/32",
+      "tag": {
+        "member": [
+          "test"
+        ]
+      }
+    },
+    {
+      "name": "test12345",
+      "description": "test12345",
+      "ip-netmask": "1.2.3.5/32",
+      "tag": {
+        "member": [
+          "test"
+        ]
+      }
+    }
+  ],
+  "address-group": [
+    {
+      "name": "test-servers",
+      "description": "test servers",
+      "static": {
+        "member": [
+          "test1234",
+          "test12345"
+        ]
+      }
+    }
+  ],
+  "service": [
+    {
+      "name": "test-2222",
+      "description": "test-2222",
+      "protocol": "TCP",
+      "port": "2222",
+      "source-port": "any"
+    }
+  ],
+  "service-group": [
+    {
+      "name": "test-service-group",
+      "static": {
+        "member": [
+          "test-2222",
+          "tcp-443"
+        ]
+      }
+    }
+  ],
+  "tag": [
+    {
+      "name": "test",
+      "color": "blue",
+      "comments": "Test systems"
+    }
+  ],
+  "application": []
+}

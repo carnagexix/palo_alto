@@ -1,10 +1,36 @@
 """Offline tests using fakes only; never reaches Panorama."""
 import importlib.util
 import json
+import sys
+import types
 import unittest
 from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
+
+try:
+    import requests  # noqa: F401
+except ImportError:
+    # Offline tests never touch the network; stub the imports so the
+    # suite is runnable anywhere without extra packages.
+    if 'requests' not in sys.modules:
+        _req = types.ModuleType('requests')
+
+        class _NoNetSession:
+            def __getattr__(self, _name):
+                raise RuntimeError('network use in offline test')
+        _req.Session = _NoNetSession
+        sys.modules['requests'] = _req
+    else:
+        _req = sys.modules['requests']
+        if not hasattr(_req, 'Session'):
+            class _NoNetSession:
+                def __getattr__(self, _n):
+                    raise RuntimeError('network use in offline test')
+            _req.Session = _NoNetSession
+    _u3 = types.ModuleType('urllib3')
+    _u3.disable_warnings = lambda *a, **k: None
+    sys.modules.setdefault('urllib3', _u3)
 
 spec=importlib.util.spec_from_file_location('panorama_cli', Path(__file__).resolve().with_name('panorama_cli.py'))
 p=importlib.util.module_from_spec(spec)
@@ -95,10 +121,10 @@ class RuleFixTests(unittest.TestCase):
                {'member':['original-host','new-a','new-b']},['new-a','new-b'])]
         with patch.object(p,'safe_filename',return_value='/tmp/test.txt'):
             fname,output=p._rule_cli_script('query',plan,[('FAILED','no route')])
-        self.assertIn('set device-group "DG" post-rulebase security rules "My Rule With Spaces" source "new-a"',output)
-        self.assertNotIn('clear device-group',output)
-        self.assertNotIn('source member',output)
-        self.assertEqual(output.count('\nset device-group'),2) # one line per new object
+        self.assertIn('set device-group "DG" post-rulebase security rules '
+                      '"My Rule With Spaces" source member "new-a"', output)
+        self.assertNotIn('clear device-group', output)
+        self.assertEqual(output.count('\nset device-group'), 2)  # per new object
 
     def test_indirect_group_only_is_not_edited(self):
         indirect = {**self.record(), 'rule': 'Via group',

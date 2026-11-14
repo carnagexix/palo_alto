@@ -56,10 +56,9 @@ OBJECT_TYPES = [
 ]
 # Order in which object types are applied so references resolve (groups
 # reference addresses/services, objects reference tags).
-BUILD = "2026-11-14-fix6 (rule description append uses space separator)"
+BUILD = "2026-11-14-fix7 (generic recursive device-group discovery; removed org-specific group names; README disclaimer + authors)"
 APPLY_ORDER = ["tag", "application", "service", "service-group", "address",
                "address-group"]
-DG_GROUPS = ("DevGroup", "DynGroup")  # static and dynamic device groups
 SHARED_LABEL = "(shared)"  # pseudo group for shared objects
 # Modern REST API (/restapi/<ver>/...); 12.1 was verified to serve v11.0.
 REST_VERSIONS = ("v11.0", "v12.0", "v10.0")
@@ -172,7 +171,7 @@ def as_entry_list(result) -> list[dict]:
 def dig(obj, *keys):
     """Walk nested dicts/lists; bare names match entry@name, e.g.
 
-    dig(config, "device-group", "DevGroup", "MY-DG", "address").
+    dig(config, "device-group", "MY-DG", "address").
     """
     for key in keys:
         if isinstance(obj, dict):
@@ -879,7 +878,7 @@ def dg_containers(config) -> list[dict]:
                 if (key == "device-group" and isinstance(value, list)
                         and id(value) not in ids):
                     # PAN-OS 12.x: direct entry list under
-                    # config/devices/device-group, no DevGroup wrapper.
+                    # config/devices/device-group, entries listed directly.
                     ids.add(id(value))
                     seen.append({"entry": value})
                 walk(key, value)
@@ -891,22 +890,20 @@ def dg_containers(config) -> list[dict]:
     return seen
 
 
-def print_dg_container_shapes(config) -> None:
-    """Dump every device-group-shaped container with its config path."""
-    def walk(path: str, node):
-        if isinstance(node, dict):
-            if "DevGroup" in node or "DynGroup" in node:
-                print(f"  {path} -> keys: {sorted(node)}", file=sys.stderr)
-            for key, value in node.items():
-                walk(f"{path}/{key}", value)
-        elif isinstance(node, list):
-            for item in node:
-                name = item.get("name") if isinstance(item, dict) else None
-                walk(f"{path}{'[' + str(name) + ']' if name else ''}", item)
+def _dg_entries(container) -> list[dict]:
+    """All device-group entries in a container, including nested
+    group-of-groups entries, at any depth."""
+    out: list[dict] = []
+    for entry in as_entry_list(container):
+        out.append(entry)
+        if isinstance(entry.get("entry"), (dict, list)):
+            out += _dg_entries(entry)
+    return out
 
-    print("container shapes (DevGroup/DynGroup) with paths:", file=sys.stderr)
-    walk("config", config)
-    # And show where 'device-group' keys live even if shape unexpected.
+
+def print_dg_container_shapes(config) -> None:
+    """Dump every device-group container with its config path."""
+    # Show where 'device-group' keys live even if shape unexpected.
     def walk2(path: str, node):
         if isinstance(node, dict):
             for key, value in node.items():
@@ -965,19 +962,13 @@ def rest_paged(client: PanoramaClient, resource: str, params: dict) -> list[dict
 
 def list_device_groups(client: PanoramaClient) -> list[str]:
     # PAN-OS 12.x keeps device groups in the XML config tree under
-    # /devices/device-group as a direct entry list.
+    # /devices/device-group as a direct entry list; older builds may nest
+    # groups inside groups. Collect every entry name at any depth.
     names: list[str] = []
     config = client.running_config()
     for container in dg_containers(config):
-        for group in DG_GROUPS:
-            node = container.get(group)
-            if node is not None:
-                names += [e["name"] for e in as_entry_list(node)
-                          if e.get("name")]
-        if not any(container.get(g) for g in DG_GROUPS):
-            # Older schema or PAN-OS 12.x: entries directly in container.
-            names += [e["name"] for e in as_entry_list(container)
-                      if e.get("name")]
+        names += [e["name"] for e in _dg_entries(container)
+                  if e.get("name")]
     if names:
         return sorted(set(names))
 
@@ -1027,13 +1018,9 @@ def find_device_group(client: PanoramaClient, device_group: str) -> dict | None:
         shared = config.get("shared")
         return shared if isinstance(shared, dict) else None
     for container in dg_containers(config):
-        for group in DG_GROUPS:
-            entry = dig(container, group, device_group)
-            if entry is not None:
+        for entry in _dg_entries(container):
+            if entry.get("name") == device_group:
                 return entry
-        entry = dig(container, device_group)
-        if entry is not None:
-            return entry
     return None
 
 
@@ -1086,10 +1073,12 @@ def obj_to_xml(obj: dict) -> str:
 def dg_set_paths(device_group: str, obj_type: str, name: str) -> list[str]:
     sel = f"entry[@name='{xpath_quote(name)}']"
     if device_group == SHARED_LABEL:
-        return [f"/devices/LocalDevice/shared/{obj_type}/{sel}",
-                f"/shared/{obj_type}/{sel}"]
+        return [f"/config/shared/{obj_type}/{sel}",
+                f"/devices/LocalDevice/shared/{obj_type}/{sel}"]
     dg_sel = f"entry[@name='{xpath_quote(device_group)}']"
-    return [f"/devices/LocalDevice/device-group/DevGroup/{dg_sel}/{obj_type}/{sel}",
+    return [f"/config/devices/entry[@name='localhost.localdomain']"
+            f"/device-group/{dg_sel}/{obj_type}/{sel}",
+            f"/devices/LocalDevice/device-group/{dg_sel}/{obj_type}/{sel}",
             f"/dev/group/{dg_sel}/{obj_type}/{sel}"]
 
 

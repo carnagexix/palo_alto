@@ -7,6 +7,12 @@ releases via fallbacks).
 
 Only Python 3.8+ and the `requests` library are required.
 
+> **Use at your own risk.** This tool reads and writes live Panorama
+> configuration (objects, address groups, and security rules) through the
+> Panorama API. Always review the before/after diffs, prefer leaving changes
+> pending for inspection, and test on a noncritical device group or rule
+> first. The authors accept no liability for damage or downtime.
+
 ```
 pip install requests
 ```
@@ -279,8 +285,9 @@ and members must be JSON, e.g. `{"member": ["office", "prod"]}`):
   `<show><system><info/></system></show>`.
 - `type=config action=get` returns an empty candidate (`code 7`); the script
   reads the committed config with `action=show` instead and parses that.
-- Device groups live under `/devices/device-group` as a plain entry list (no
-  `DevGroup` wrapper); the script locates them by scanning the config tree.
+- Device groups live under `/devices/device-group` as a plain entry list (and
+  may be nested as groups-of-groups); the script locates them by scanning the
+  config tree recursively.
 - Writes use `action=set` POSTed to both the 12.x and legacy `/dev/group`
   paths; if your Panorama rejects both, run with `--debug` to inspect the
   exact error.
@@ -294,3 +301,16 @@ and members must be JSON, e.g. `{"member": ["office", "prod"]}`):
   diagnostics), stale key (`--renew-key`), or an admin role without Panorama
   read access.
 - **API key invalid/expired** (code 4) - `--renew-key`.
+
+## Authors & Credits
+
+- **carnagexix** - project owner; ran, tested, and tuned everything against
+  production Panorama.
+- **opencode** - AI coding assistant; built the object browser, where-used
+  search, group/rule editing flows, exports, and diagnostics, and maintains
+  this repo.
+- **ChatGPT** (OpenAI) - AI assistant; identified the correct Panorama REST
+  policy endpoints (`/Policies/{Type}{Pre,Post}Rules`) and the
+  `localhost.localdomain` XML config path, wrote the offline
+  `test_panorama_rule_fix.py` suite, and contributed the direct-only
+  rule-match safety model.
