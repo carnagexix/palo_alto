@@ -48,7 +48,7 @@ Running with **no arguments** prints this help menu.
 | `--user` / `--password` | admin credentials (env: `PANORAMA_USER` / `PANORAMA_PASSWORD`); password is prompted hidden if omitted |
 | `--output {text,json,csv}` | skip the Action menu and export directly; json/csv are saved to `<device_group>_<obj_type>.<ext>` in the current directory (spaces/special chars become underscores) |
 | `--renew-key` | delete the cached API key and generate a fresh one |
-| `--debug` | print every raw API request/response to stderr |
+| `--debug` | print diagnostic API details to stderr (large configuration bodies are suppressed) |
 | `--diagnose` | run an API probe battery (op/config/REST) and dump raw responses - use this first when API access looks wrong |
 
 ## Export
@@ -177,7 +177,7 @@ After export, an **action menu** appears when there is anything to edit:
 ```
 Next action:
   [1] add/modify address groups that use this object
-  [2] add address/address-group objects to existing rules that use this object
+  [2] add address/address-group objects to rules directly containing this object
 Select number (Enter=skip):
 ```
 
@@ -191,29 +191,34 @@ diff is written, and the post-update menu offers **commit (optional
 description)**, **revert these group changes** (`..._group-revert_<ts>.txt`
 diff) or **leave pending**.
 
-Option 2 offers **adding address / address-group objects to those rules**:
-enter names comma-separated, or
-`@file.txt` with one name per line. Names that do not exist (or are not
-address/address-group objects) are **warned about and skipped**. Members are
-added to the **same field the search hit** (`source`, `destination` - shown
-as `before: source: ...` / `before: destination: ...`),
-member lists only (rules where the field is `any` are skipped), and members
-already present are not duplicated. A before/after preview is shown per rule
-field before anything is sent; after applying, a diff
-(`where-used_<query>_rule-edit_<ts>.txt`) lists `UPDATED`/`FAILED` per rule
-with `- before:` / `+ after:` / `+ added:` member lists. Post-update menu:
-**commit (with optional description)**, **revert these rule changes**
-(restores the original member lists per rule, writes its own
-`where-used_<query>_rule-revert_<ts>.txt` diff), or **leave pending**.
+Option 2 offers **adding address / address-group objects only to rules that
+DIRECTLY contain the searched address/address-group object**, rather than
+rules that refer to it only indirectly through an address group. Group-based
+(indirect) rule matches are still listed in the where-used search output, but
+they are excluded from the edit plan. If one rule field matches directly and
+another only indirectly, only the directly matching field is edited.
 
-Note: on builds where the modern REST API does not expose rule resources
-(`HTTP 501 Route Not Found` on `/Rules/...`), the XML API refuses `set`
-(code 16) **and** `type=op` `load/config/partial` is refused (code 17 on
-every subtree root), rule edits cannot be applied through the API at all -
-the tool then auto-generates a **CLI fallback script**
-(`where-used_<query>_rule-edit-cli_<ts>.txt`) with paste-ready `clear`/`set`
-lines for the Panorama CLI, and skips remaining attempts. Run `--diagnose`
-to see which rule-related routes the box actually supports.
+Enter names comma-separated, or `@file.txt` with one name per line. Names
+that do not exist (or are not address/address-group objects) are warned about
+and skipped. Members are appended to the **same directly matched field**
+(`source` or `destination`); fields containing `any` are skipped and
+existing members are not duplicated. Review the per-field before/after
+preview, then type `yes` to apply. The diff
+(`where-used_<query>_rule-edit_<ts>.txt`) records `UPDATED`/`FAILED`,
+before/after, and added members. The post-update menu provides **commit**,
+**revert these rule changes**, or **leave pending**.
+
+Rule writes use the Panorama policies REST endpoints
+(`/restapi/v11.0/Policies/SecurityPreRules` and
+`/restapi/v11.0/Policies/SecurityPostRules` for security rules), with
+XML configuration API fallbacks. The updater reads the current candidate rule
+before modifying its member list to retain existing/pending values and
+checks the result. If the server rejects policy API writes, the tool
+generates a CLI fallback script
+(`where-used_<query>_rule-edit-cli_<ts>.txt`) using append-only `set`
+operations instead of clearing the existing list. Check the reported API
+error and permissions if writes fail; `--diagnose` can help investigate.
+**Test on a noncritical rule and review the candidate diff before committing.**
 
 Note: object resolution is by name across all device groups and shared;
 cross-device-group scoping nuances (e.g. a group with the same name in two
