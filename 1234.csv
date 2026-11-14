@@ -1,6 +1,0 @@
-type,name,description,ip-netmask,ip-range,ip-wildcard,country,static,protocol,port,source-port,tag,color,comments,category,subcategory
-tag,test,,,,,,,,,,,blue,Test systems,,
-address,test1234,test1234,1.2.3.4/32,,,,,,,,{"member": ["test"]},,,,
-address,test12345,test12345,1.2.3.5/32,,,,,,,,{"member": ["test"]},,,,
-address-group,test-servers,test servers,,,,,"{""member"": [""test1234"", ""test12345""]}",,,,,,,,
-service,test-2222,test-2222,,,,,,TCP,2222,any,,,,,

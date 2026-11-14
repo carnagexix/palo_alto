@@ -21,3 +21,7 @@ __pycache__/
 *_application.csv
 *_tag.json
 *_tag.csv
+
+# ad-hoc test exports
+*.csv.tmp
+1234.*
