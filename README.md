@@ -176,21 +176,28 @@ After export, an **action menu** appears when there is anything to edit:
 
 ```
 Next action:
-  [1] add/modify address groups that use this object
+  [1] add/remove objects in the matched address group(s)   (only when the
+      searched object is an address group)
   [2] add address/address-group objects to rules DIRECTLY containing
       the matched object(s) (group-mediated rule hits are excluded)
 Select number (Enter=skip):
 ```
 
-Option 1 offers **adding address / address-group objects to the address
-groups that use the searched object** (address groups only; other group
-types are listed for reference only): the same name validation and
-before/after preview apply. **Group writes work through the modern REST
-objects API** even on builds that block everything else, so these edits
-actually take effect. After applying, a `where-used_<query>_group-edit_<ts>.txt`
-diff is written, and the post-update menu offers **commit (optional
-description)**, **revert these group changes** (`..._group-revert_<ts>.txt`
-diff) or **leave pending**.
+Option **[2] is always offered**. Option **[1] appears only when at least one
+matched object is itself an address group** (for plain addresses only [2] is
+offered).
+
+Option 1 opens a submenu: **[1] add objects** to the matched address group(s)
+or **[2] remove objects** from them. Names may be entered comma-separated, as
+a single name, or imported via `@file.txt` (one name per line); unknown or
+non-address objects are warned about and skipped, and remove requests for
+names that are not members are skipped. A before/after preview is shown per
+group; after applying, a `where-used_<query>_group-edit_<ts>.txt` diff
+records `- before` / `+ after` / `+ added` (or `- removed`) per group.
+**Group writes work through the REST objects API**, so these edits actually
+take effect. The post-update menu offers **commit (optional description)**,
+**revert these group changes** (`..._group-revert_<ts>.txt` diff, restoring
+the exact original member list) or **leave pending**.
 
 Option 2 offers **adding address / address-group objects only to rules that
 DIRECTLY contain the searched address/address-group object**, rather than
