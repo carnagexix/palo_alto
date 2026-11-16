@@ -34,6 +34,7 @@ import getpass
 import io
 import json
 import os
+import re
 import sys
 import xml.etree.ElementTree as ET
 from datetime import datetime
@@ -56,7 +57,7 @@ OBJECT_TYPES = [
 ]
 # Order in which object types are applied so references resolve (groups
 # reference addresses/services, objects reference tags).
-BUILD = "2026-11-14-fix8 (new mode: convert object files CSV <-> JSON)"
+BUILD = "2026-11-14-fix9 (new mode: config snapshots - save on Panorama, export local XML+JSON, list)"
 APPLY_ORDER = ["tag", "application", "service", "service-group", "address",
                "address-group"]
 SHARED_LABEL = "(shared)"  # pseudo group for shared objects
@@ -757,6 +758,94 @@ class PanoramaClient:
                 raise RuntimeError(f"{first}; retry with panorama param: "
                                    f"{exc}")
         raise first
+
+    def config_show_raw(self) -> str:
+        """Return the committed configuration as raw XML text."""
+        url = f"https://{self.host}/api/{API_VERSION}"
+        params = {"key": self.api_key, "api-version": API_VERSION,
+                  "type": "config", "action": "show"}
+        resp = self.session.get(url, params=params, timeout=self.timeout,
+                                 verify=False)
+        if self.debug:
+            print(f"REQUEST {url}\nparams: key=<redacted> type=config "
+                  f"action=show\n[raw XML, {len(resp.content)} bytes]",
+                  file=sys.stderr)
+        resp.raise_for_status()
+        root = ET.fromstring(resp.content)
+        if root.get("status") != "success":
+            code = root.get("code") or "?"
+            msg = root.findtext("msg") or resp.text[:200]
+            raise RuntimeError(f"Panorama API error (code {code}): {msg}")
+        result = root.find("result")
+        if result is None:
+            return resp.text
+        return ET.tostring(result, encoding="unicode")
+
+    def create_snapshot(self, name: str, description: str = "") -> str:
+        """Take a Panorama configuration snapshot; try REST commands first,
+        then the XML op equivalents. Returns the method that worked."""
+        entry = {"@name": name}
+        if description:
+            entry["description"] = description
+        errs: list[str] = []
+        for path in (f"{self.rest_base()}/Commands/Snapshot/Config",
+                     f"{self.rest_base()}/Commands/SnapshotConfig"):
+            try:
+                self._rest("POST", path, {"panorama": "LocalDevice"},
+                           {"entry": [entry]})
+                return f"REST {path}"
+            except RuntimeError as exc:
+                errs.append(f"REST {path}: {exc}")
+        desc = (f"<description>{escape(description)}</description>"
+                if description else "")
+        for cmd in (
+                f"<commands><snapshot><config>"
+                f"<entry name=\"{escape(name)}\">{desc}</entry>"
+                f"</config></snapshot></commands>",
+                f"<commands><export><config>"
+                f"<snapshot name=\"{escape(name)}\"/>"
+                f"</config></export></commands>"):
+            try:
+                self._request({"type": "op", "cmd": cmd})
+                return "XML op " + cmd[:40] + "..."
+            except RuntimeError as exc:
+                errs.append(f"XML op: {exc}")
+        raise RuntimeError("; ".join(errs))
+
+    def list_snapshots(self) -> list[dict]:
+        """List saved configuration snapshots (best-effort probe)."""
+        try:
+            data = self._rest("GET",
+                              f"{self.rest_base()}/Commands/Snapshot/Config",
+                              {"panorama": "LocalDevice"})
+            result = (data.get("result")
+                      if isinstance(data.get("result"), dict) else data)
+            entries = result.get("entry") if isinstance(result, dict) else None
+            if isinstance(entries, dict):
+                entries = [entries]
+            if isinstance(entries, list):
+                return [e for e in entries if isinstance(e, dict)]
+        except RuntimeError as exc:
+            rest_err = str(exc)
+        else:
+            return []
+        try:
+            result = self._request({"type": "op", "cmd":
+                                    "<commands><show><snapshot>"
+                                    "<config/></snapshot></show></commands>"})
+        except RuntimeError as exc:
+            raise RuntimeError(f"REST: {rest_err}; XML op: {exc}")
+        node = result
+        if isinstance(node, dict):
+            node = node.get("snapshot", node)
+            if isinstance(node, dict):
+                node = node.get("config", node)
+                entries = node.get("entry") if isinstance(node, dict) else None
+                if isinstance(entries, dict):
+                    entries = [entries]
+                if isinstance(entries, list):
+                    return [e for e in entries if isinstance(e, dict)]
+        return []
 
     def running_config(self) -> dict:
         """Fetch the full committed running config once and cache it.
@@ -2706,6 +2795,79 @@ def convert_mode() -> None:
         print(f"  Conversion failed: {exc}", file=sys.stderr)
 
 
+def _snap_name(raw: str) -> str:
+    return re.sub(r"[^\w.-]+", "_", raw).strip("_") or "snapshot"
+
+
+def snapshot_mode(client: PanoramaClient) -> None:
+    """Save/list/export Panorama configuration snapshots (dated names)."""
+    actions = ["save configuration snapshot on Panorama",
+               "export configuration locally (XML + JSON)",
+               "list snapshots",
+               "back to main menu"]
+    action = choose(actions, "Snapshots")
+    if action == actions[3]:
+        return
+
+    if action == actions[0]:
+        raw = input("Snapshot name: ").strip().strip('"').strip("'")
+        name = f"{_snap_name(raw)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        comment = f"saved by panorama_cli {datetime.now().isoformat(timespec='seconds')}"
+        print(f"Saving snapshot '{name}' on Panorama ...")
+        try:
+            via = client.create_snapshot(name, comment)
+        except RuntimeError as exc:
+            print(f"  Snapshot save failed: {exc}", file=sys.stderr)
+            print("  (Check role/API access; run with --debug to inspect "
+                  "the exact responses.)", file=sys.stderr)
+            return
+        print(f"Snapshot '{name}' saved via {via}.")
+        return
+
+    if action == actions[1]:
+        raw = input("Name for the local export (Enter = running-config): ") \
+            .strip().strip('"').strip("'")
+        name = _snap_name(raw) if raw else "running-config"
+        print("Fetching committed configuration ...")
+        try:
+            xml_text = client.config_show_raw()
+        except (RuntimeError, requests.RequestException) as exc:
+            print(f"  Export failed: {exc}", file=sys.stderr)
+            return
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        xml_path = safe_filename("snapshot", f"{name}_{ts}", "xml")
+        json_path = safe_filename("snapshot", f"{name}_{ts}", "json")
+        Path(xml_path).write_text(xml_text, encoding="utf-8")
+        try:
+            parsed = client.running_config()
+            Path(json_path).write_text(
+                json.dumps(parsed, indent=2, ensure_ascii=False),
+                encoding="utf-8")
+            print(f"Exported config snapshot '{name}' ({len(xml_text):,} "
+                  f"bytes) to:\n  {xml_path}\n  {json_path}")
+        except (OSError, RuntimeError) as exc:
+            print(f"  XML saved ({xml_path}); JSON failed: {exc}",
+                  file=sys.stderr)
+        return
+
+    if action == actions[2]:
+        print("Listing configuration snapshots ...")
+        try:
+            entries = client.list_snapshots()
+        except RuntimeError as exc:
+            print(f"  Could not list snapshots: {exc}", file=sys.stderr)
+            return
+        if not entries:
+            print("  No snapshots found (or this Panorama does not expose "
+                  "them through the API).")
+            return
+        for entry in entries:
+            name = entry.get("@name") or entry.get("name") or "?"
+            desc = entry.get("description") or ""
+            print(f"  {name}" + (f"  [{desc}]" if desc else ""))
+        return
+
+
 def _names_from_convert_file(path: str) -> list[str]:
     names: list[str] = []
     text = Path(path).read_text(encoding="utf-8", errors="replace")
@@ -2975,6 +3137,7 @@ def main() -> None:
     modes = ["explore device-group objects (browse/export/import/copy)",
              "find where an object is used (rule search)",
              "convert object files (CSV <-> JSON)",
+             "configuration snapshots (save/export/list)",
              "quit"]
     while True:
         if args.output == "text":
@@ -2988,6 +3151,8 @@ def main() -> None:
             where_used(client)
         elif mode.startswith("convert "):
             convert_mode()
+        elif mode.startswith("configuration "):
+            snapshot_mode(client)
         else:
             explore_objects(client, args)
         if args.output != "text":

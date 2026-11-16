@@ -31,7 +31,7 @@ Interactive flow:
 
 ```
 Mode            -> [1] explore device-group objects   [2] find where an object is used
-                   [3] convert object files (CSV <-> JSON)   [4] quit
+                   [3] convert object files (CSV <-> JSON)   [4] config snapshots   [5] quit
 Mode 1 (explore):
 Device groups   -> pick one (number), or "(shared)" for shared objects
 Action          -> [1] list objects   [2] export CSV/JSON   [3] import CSV/JSON
@@ -46,6 +46,14 @@ Conversion      -> [1] convert CSV to JSON   [2] convert JSON to CSV
                    (or a plain list when no type column exists), CSV has a
                    leading `type` column; nested values (tags, members) are
                    embedded as JSON. Round-trip CSV -> JSON -> CSV is lossless.
+Mode 4 (snapshots):
+Snapshots       -> [1] save configuration snapshot on Panorama
+                   [2] export configuration locally (XML + JSON)
+                   [3] list snapshots   [4] back to main menu
+                   Saved snapshots get the entered base name plus a
+                   `YYYYMMDD_HHMMSS` date stamp. The local export downloads
+                   the committed configuration through the API and writes
+                   `snapshot_<name>_<date>.xml` and `.json` locally.
 ```
 
 Both menus repeat after each action/pass, so you can browse, export, import,
@@ -53,6 +61,45 @@ convert and run rule searches as often as you want per session before
 quitting. `--output json/csv` is a one-shot export.
 
 Running with **no arguments** prints this help menu.
+
+## Panorama access requirements
+
+The script talks to Panorama **only** over HTTPS (TCP 443) on the management
+interface, using the standard APIs below. Make sure all of these are
+reachable/permitted before reporting "unauthorized" issues:
+
+- **Network / service**: HTTPS 443 allowed from the client to Panorama
+  (management interface ACL on Panorama + intervening firewalls), TLS 1.2+.
+  The script does **not** verify TLS certificates (`verify=False`); pin a
+  CA yourself or accept that risk.
+- **Admin account and role**: an admin that can log in to the Panorama web
+  UI. Read-only browsing/searching works with read access; **imports, rule
+  and group edits, commits and snapshots require a write-capable role**
+  (superuser, or Panorama Administrator / Device Management with config and
+  commit rights). If `type=config action=set|edit` comes back
+  `unauth code 16`, the API key - not the account - lacks write rights:
+  regenerate it from a full-rights session (`request api-key`) or the UI.
+- **API key**: generated on first run via `type=op <request-api-key>`; it
+  inherits the role of the generating session. API keys and admin users can
+  additionally be restricted by an **API authentication profile** (MFA /
+  authentication factor) - if your org enforces one for API access, script
+  writes will be rejected and must be exempted or performed in the UI.
+- **XML API (`/api/`)** must be enabled (it is by default): used for config
+  `show`/`get`/`set`/`edit`, and `op` commands (`commit`, snapshot save,
+  system info).
+- **Modern REST API (`/restapi/`)** must be enabled (default). The script
+  auto-probes the version and needs these resources depending on what you
+  do:
+  - objects/groups: `Objects/Addresses`, `Objects/AddressGroups`,
+    `Objects/Services`, `Objects/ServiceGroups`, `Objects/Applications`,
+    `Objects/Tags`
+  - security rules: `Policies/SecurityPreRules` / `Policies/SecurityPostRules`
+    (rule updates are REST `PUT`; XML `action=edit` is the fallback)
+  - commits: `Commit`
+  - config snapshots: `Commands/Snapshot/Config` (XML `op
+    <snapshot><config>` fallback)
+  If a route answers `501 Route Not Found`, that Panorama build does not
+  serve that resource - the script falls back to the XML API where possible.
 
 ## Command-line options
 
