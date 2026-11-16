@@ -11,7 +11,7 @@ Only Python 3.8+ and the `requests` library are required.
 
 | Platform | Status | Notes |
 |---|---|---|
-| **PAN-OS 12.1.x Panorama** | **Tested & supported** (12.1.10-h3) | All features work: browse/export/import/copy, where-used, CSV↔JSON convert, address-group add/remove, rule updates via REST `Policies/*{Pre,Post}Rules`, commits. On-device config snapshots are **UI-only** (API refuses them on this build; local dated export works). |
+| **PAN-OS 12.1.x Panorama** | **Tested & supported** (12.1.10-h3) | All features work: browse/export/import/copy, where-used, CSV↔JSON convert, address-group add/remove, rule updates via REST `Policies/*{Pre,Post}Rules`, commits. Mode 4 now saves named candidate snapshots and lists saved snapshot filenames using XML operational API; live verification of these fixes is pending. |
 | PAN-OS 12.0 Panorama | Expected to work (not tested) | Same REST v11 API surface; version is auto-probed. |
 | PAN-OS 11.x Panorama | Expected to work (not tested) | Falls back across XML API paths and REST v11/v10 endpoints; rule-edit endpoints (`/Policies/...`) must exist on the build - verify with `--diagnose`. |
 | PAN-OS 10.x Panorama | Best-effort (not tested) | XML API works; newer REST resources may be missing, so some operations rely on XML fallbacks or the CLI script. |
@@ -65,20 +65,19 @@ Conversion      -> [1] convert CSV to JSON   [2] convert JSON to CSV
                    leading `type` column; nested values (tags, members) are
                    embedded as JSON. Round-trip CSV -> JSON -> CSV is lossless.
 Mode 4 (snapshots):
-Snapshots       -> [1] save configuration snapshot on Panorama
-                   [2] export configuration locally (XML + JSON)
-                   [3] list snapshots   [4] back to main menu
-                   Saved snapshots get the entered base name plus a
-                   `YYYYMMDD_HHMMSS` date stamp. The local export downloads
-                   the committed configuration through the API and writes
-                   `snapshot_<name>_<date>.xml` and `.json` locally.
-                   NOTE: some Panorama builds (verified on 12.1.10-h3) do
-                   not expose snapshot creation/listing to API clients at
-                   all (REST routes not served; the op `export` command is
-                   refused with "export not available to xmlapi client").
-                   The script detects this once, explains it, and offers to
-                   save the dated snapshot locally instead; take on-device
-                   snapshots in the Panorama UI if you need them server-side.
+Snapshots       -> [1] save named candidate-configuration snapshot on Panorama
+                   [2] export committed running config locally (XML + JSON)
+                   [3] list named snapshots saved on Panorama
+                   [4] back to main menu
+                   Snapshot filenames are generated as
+                   <base_name>_YYYYMMDD_HHMMSS.xml.
+                   The API save uses the candidate configuration, including
+                   pending uncommitted changes; it does NOT commit.
+                   The local XML+JSON export reads the committed running
+                   configuration (which may differ from the candidate).
+                   Save or list failures report the actual XML API error.
+                   A failed save offers an optional local export.
+
 ```
 
 Both menus repeat after each action/pass, so you can browse, export, import,
@@ -99,7 +98,7 @@ reachable/permitted before reporting "unauthorized" issues:
   CA yourself or accept that risk.
 - **Admin account and role**: an admin that can log in to the Panorama web
   UI. Read-only browsing/searching works with read access; **imports, rule
-  and group edits, commits and snapshots require a write-capable role**
+  and group edits, commits and saving snapshots require a write-capable role**
   (superuser, or Panorama Administrator / Device Management with config and
   commit rights). If `type=config action=set|edit` comes back
   `unauth code 16`, the API key - not the account - lacks write rights:
@@ -121,13 +120,41 @@ reachable/permitted before reporting "unauthorized" issues:
   - security rules: `Policies/SecurityPreRules` / `Policies/SecurityPostRules`
     (rule updates are REST `PUT`; XML `action=edit` is the fallback)
   - commits: `Commit`
-  - config snapshots: `Commands/Snapshot/Config` (XML `op
-    <snapshot><config>` fallback). **Availability varies by build**: on
-    PAN-OS 12.1.10-h3 the snapshot routes are not served and op `export`
-    is refused for API clients, so server-side snapshots are UI-only
-    there; the local export option works everywhere.
+  - saved configuration snapshots use the **XML operational API**, not
+    a REST `Commands/Snapshot/*` resource. See Mode 4 below.
   If a route answers `501 Route Not Found`, that Panorama build does not
   serve that resource - the script falls back to the XML API where possible.
+
+## Panorama configuration snapshots (Mode 4)
+
+Mode 4 uses supported XML operational API requests over HTTPS with the
+currently authenticated Panorama API key:
+
+- **Save a named snapshot on Panorama:** `type=op` with
+  `cmd=<save><config><to>name_YYYYMMDD_HHMMSS.xml</to></config></save>`.
+  This saves the **candidate** configuration (including pending changes)
+  on Panorama, without committing or changing the running configuration.
+  The XML command does not support a snapshot description. The script adds
+  a timestamp to avoid accidentally overwriting an existing snapshot.
+- **List saved snapshots on Panorama:** `type=op&action=complete` with
+  `xpath=/operations/show/config/saved`. The API returns CLI-completion
+  entries containing saved configuration filenames, not their full XML or
+  guaranteed creation dates. Built-in running/candidate file entries are
+  excluded from the displayed list. An empty list and an API error are
+  reported distinctly.
+- **Export locally:** fetch the **committed running** configuration and write
+  `snapshot_<name>_<timestamp>.xml` plus `.json` in the current directory.
+  This is **not** equivalent to saving a candidate snapshot on Panorama.
+
+A save/list error may reflect missing API privileges or a PAN-OS version
+difference. Use `--debug` and examine the specific response; the CLI does
+not assume that API errors mean snapshots are unsupported. If saving on
+Panorama fails, the menu offers an optional local running-config export.
+
+**Security:** Local XML/JSON exports may contain sensitive configuration
+data; protect and restrict access to the exported files. The repository's
+`.gitignore` excludes generated `snapshot_*.xml` and `snapshot_*.json`
+files, but this does not protect copies stored elsewhere.
 
 ## Command-line options
 

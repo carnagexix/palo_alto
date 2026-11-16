@@ -57,7 +57,7 @@ OBJECT_TYPES = [
 ]
 # Order in which object types are applied so references resolve (groups
 # reference addresses/services, objects reference tags).
-BUILD = "2026-11-14-fix13 (snapshots: cache unsupported state, concise reason, auto-offer local dated snapshot fallback)"
+BUILD = "2026-11-16-fix14 (snapshots: XML save config, op-completion snapshot listing)"
 APPLY_ORDER = ["tag", "application", "service", "service-group", "address",
                "address-group"]
 SHARED_LABEL = "(shared)"  # pseudo group for shared objects
@@ -811,106 +811,56 @@ class PanoramaClient:
             return resp.text
         return ET.tostring(result, encoding="unicode")
 
-    def _snapshot_api_unsupported(self) -> bool:
-        return getattr(self, "_snap_unsupported", False)
-
-    def _mark_snapshot_api_unsupported(self, reason: str) -> None:
-        self._snap_unsupported = True
-        self._snap_reason = reason
-
     def create_snapshot(self, name: str, description: str = "") -> str:
-        """Take a Panorama configuration snapshot; try REST commands first,
-        then the XML op equivalents (op cmd trees have no <commands>
-        wrapper). Returns the method that worked."""
-        if self._snapshot_api_unsupported():
-            raise RuntimeError(getattr(self, "_snap_reason",
-                                       "snapshots not exposed via API"))
-        entry = {"@name": name}
-        if description:
-            entry["description"] = description
-        errs: list[str] = []
-        for path in (f"{self.rest_base()}/Commands/Snapshot/Config",
-                     f"{self.rest_base()}/Commands/SnapshotConfig",
-                     f"{self.rest_base()}/Commands/Snapshot"):
-            try:
-                self._rest("POST", path, {"panorama": "LocalDevice"},
-                           {"entry": [entry]})
-                return f"REST {path}"
-            except RuntimeError as exc:
-                errs.append(f"REST {path}: {exc}")
-        desc = (f"<description>{escape(description)}</description>"
-                if description else "")
-        for cmd in (
-                f"<snapshot><config>"
-                f"<entry name=\"{escape(name)}\">{desc}</entry>"
-                f"</config></snapshot>",
-                f"<export><config>"
-                f"<snapshot name=\"{escape(name)}\"/>"
-                f"</config></export>"):
-            try:
-                self._request({"type": "op", "cmd": cmd})
-                return "XML op " + cmd[:40] + "..."
-            except RuntimeError as exc:
-                errs.append(f"XML op <{cmd.split('>', 1)[0][1:]}>: {exc}")
-        reason = ("this Panorama does not expose configuration snapshots "
-                  "through the API (REST snapshot routes are not served and "
-                  "the op export command is refused for API clients). "
-                  "Use 'export configuration locally' instead, or take "
-                  "snapshots in the Panorama UI.")
-        if all(("501" in e or "code 17" in e) for e in errs):
-            self._mark_snapshot_api_unsupported(reason)
-        raise RuntimeError(reason + "  Details: " + "; ".join(errs))
+        """Save a named *candidate* configuration snapshot on Panorama.
+
+        PAN-OS XML operational API: save config to <filename>.
+        A description is not supported by this command; retained here for
+        compatibility with older callers.
+        """
+        if not name or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*\.xml", name):
+            raise ValueError("snapshot filename must be a safe .xml filename")
+        if len(name) > 128:
+            raise ValueError("snapshot filename is too long (maximum 128 chars)")
+        cmd = f"<save><config><to>{escape(name)}</to></config></save>"
+        self._request({"type": "op", "cmd": cmd})
+        return "XML operational API (save config to)"
 
     def list_snapshots(self) -> list[dict]:
-        """List saved configuration snapshots (best-effort probe)."""
-        if self._snapshot_api_unsupported():
-            raise RuntimeError(getattr(self, "_snap_reason",
-                                       "snapshots not exposed via API"))
-        try:
-            data = self._rest("GET",
-                              f"{self.rest_base()}/Commands/Snapshot/Config",
-                              {"panorama": "LocalDevice"})
-            result = (data.get("result")
-                      if isinstance(data.get("result"), dict) else data)
-            entries = result.get("entry") if isinstance(result, dict) else None
-            if isinstance(entries, dict):
-                entries = [entries]
-            if isinstance(entries, list):
-                return [e for e in entries if isinstance(e, dict)]
-        except RuntimeError as exc:
-            rest_err = str(exc)
-        else:
-            return []
-        last: RuntimeError | None = None
-        op_errs: list[str] = []
-        for cmd in ("<show><snapshot/></show>",
-                    "<show><snapshot><config/></snapshot></show>",
-                    "<show><checkpoints/></show>"):
-            try:
-                result = self._request({"type": "op", "cmd": cmd})
-            except RuntimeError as exc:
-                last = exc
-                op_errs.append(str(exc))
+        """Enumerate Panorama saved config filenames via op completion API.
+
+        'show config saved <value>' supplies file names through
+        type=op&action=complete&xpath=/operations/show/config/saved.
+        Completion responses often place <completions> outside <result>,
+        so _request() would silently discard them.
+        """
+        query = {"key": self.api_key, "api-version": API_VERSION,
+                 "type": "op", "action": "complete",
+                 "xpath": "/operations/show/config/saved"}
+        url = f"https://{self.host}/api/{API_VERSION}"
+        resp = self.session.get(url, params=query, timeout=self.timeout,
+                                verify=False)
+        self._handle_response(resp, url, query)  # Validate status / debug.
+        root = ET.fromstring(resp.content)
+        nodes = root.findall(".//completion")
+        if not nodes and root.find(".//completions") is None:
+            raise RuntimeError(
+                "Panorama returned no completion list for 'show config saved'; "
+                "check XML API permissions and inspect --debug output")
+        entries = []
+        seen = set()
+        for node in nodes:
+            name = (node.get("value") or node.findtext("value")
+                    or (node.text or "")).strip()
+            # <value> is the CLI placeholder for arbitrary new names.
+            if not name or (name.startswith("<") and name.endswith(">")):
                 continue
-            node = result
-            if isinstance(node, dict):
-                node = node.get("snapshot", node)
-                if isinstance(node, dict):
-                    node = node.get("config", node)
-                    entries = (node.get("entry")
-                               if isinstance(node, dict) else None)
-                    if isinstance(entries, dict):
-                        entries = [entries]
-                    if isinstance(entries, list):
-                        return [e for e in entries if isinstance(e, dict)]
-        if ("501" in rest_err and op_errs
-                and all("code 17" in e for e in op_errs)):
-            self._mark_snapshot_api_unsupported(
-                "this Panorama does not expose configuration snapshots "
-                "through the API; saved snapshots cannot be listed or "
-                "downloaded via API on this build")
-        raise RuntimeError(f"REST: {rest_err}"
-                           + (f"; XML op: {last}" if last else ""))
+            if name.lower() in seen:
+                continue
+            seen.add(name.lower())
+            entries.append({"name": name,
+                            "description": node.get("help-string", "")})
+        return sorted(entries, key=lambda e: e["name"].casefold())
 
     def running_config(self) -> dict:
         """Fetch the full committed running config once and cache it.
@@ -2862,7 +2812,7 @@ def convert_mode() -> None:
 
 
 def _snap_name(raw: str) -> str:
-    return re.sub(r"[^\w.-]+", "_", raw).strip("_") or "snapshot"
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", raw).strip("_.-") or "snapshot"
 
 
 def _export_config_snapshot_locally(client: PanoramaClient, raw: str) -> None:
@@ -2892,33 +2842,36 @@ def _export_config_snapshot_locally(client: PanoramaClient, raw: str) -> None:
 
 
 def snapshot_mode(client: PanoramaClient) -> None:
-    """Save/list/export Panorama configuration snapshots (dated names)."""
+    """Save candidate snapshots on Panorama, list saved files, export running."""
     actions = ["save configuration snapshot on Panorama",
-               "export configuration locally (XML + JSON)",
-               "list snapshots",
+               "export committed configuration locally (XML + JSON)",
+               "list snapshots saved on Panorama",
                "back to main menu"]
     action = choose(actions, "Snapshots")
     if action == actions[3]:
         return
 
     if action == actions[0]:
-        raw = input("Snapshot name: ").strip().strip('"').strip("'")
-        name = f"{_snap_name(raw)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        comment = f"saved by panorama_cli {datetime.now().isoformat(timespec='seconds')}"
-        print(f"Saving snapshot '{name}' on Panorama ...")
+        raw = input("Snapshot name (base name, timestamp added): ").strip()
+        raw = raw.strip('"').strip("'")
+        base = raw[:-4] if raw.lower().endswith(".xml") else raw
+        name = (f"{_snap_name(base)[:108]}_"
+                f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.xml")
+        print(f"Saving candidate configuration snapshot '{name}' on Panorama ...")
         try:
-            via = client.create_snapshot(name, comment)
-        except RuntimeError as exc:
-            print(f"  {exc}", file=sys.stderr)
-            if client._snapshot_api_unsupported():
-                print("  Panorama-side snapshots are unavailable through "
-                      "this API.", file=sys.stderr)
-                if input("  Save the snapshot locally instead (dated "
-                         "XML + JSON export)? y/Enter=cancel: "
-                         ).strip().lower() == "y":
-                    _export_config_snapshot_locally(client, raw)
+            via = client.create_snapshot(name)
+        except (ValueError, RuntimeError, requests.RequestException) as exc:
+            print(f"  Snapshot save failed: {exc}", file=sys.stderr)
+            print("  This does not imply Panorama lacks snapshot support; "
+                  "verify API privileges and the server response.",
+                  file=sys.stderr)
+            if input("  Export the committed configuration locally instead "
+                     "(XML + JSON)? y/Enter=cancel: ").strip().lower() == "y":
+                _export_config_snapshot_locally(client, raw)
             return
-        print(f"Snapshot '{name}' saved via {via}.")
+        print(f"Snapshot '{name}' saved on Panorama via {via}.")
+        print("  This is the candidate configuration, including any "
+              "uncommitted changes; no commit was performed.")
         return
 
     if action == actions[1]:
@@ -2928,20 +2881,24 @@ def snapshot_mode(client: PanoramaClient) -> None:
         return
 
     if action == actions[2]:
-        print("Listing configuration snapshots ...")
+        print("Listing saved configuration files on Panorama ...")
         try:
             entries = client.list_snapshots()
-        except RuntimeError as exc:
-            print(f"  {exc}", file=sys.stderr)
+        except (RuntimeError, requests.RequestException) as exc:
+            print(f"  Unable to list snapshots: {exc}", file=sys.stderr)
             return
-        if not entries:
-            print("  No snapshots found (or this Panorama does not expose "
-                  "them through the API).")
+        # Built-in candidate/running configs are not user-created snapshots.
+        builtin = {"candidate-config", "running-config.xml", ".snapshot.xml"}
+        named = [e for e in entries
+                 if str(e.get("name", "")).lower() not in builtin]
+        if not named:
+            print("  No named configuration snapshots found.")
             return
-        for entry in entries:
-            name = entry.get("@name") or entry.get("name") or "?"
-            desc = entry.get("description") or ""
+        for entry in named:
+            name = entry.get("name", "?")
+            desc = entry.get("description", "")
             print(f"  {name}" + (f"  [{desc}]" if desc else ""))
+        print(f"  {len(named)} named snapshot(s).")
         return
 
 
