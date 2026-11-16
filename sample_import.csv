@@ -7,6 +7,6 @@ address-group,all-servers,Group of all servers,,,,,"{""member"": [""corp-dns"", 
 service,ssh-2222,SSH on alternate port,,,,,,TCP,2222,any,,,,,
 service,https,HTTPS traffic,,,,,,TCP,443,any,"{""member"": [""prod""]}",,,,
 service-group,web-svcs,Web services group,,,,,,"{""member"": [""tcp"", ""udp""]}",443,,,,,,
-tag,office,,,,,,,,,,,blue,Office sites,,
-tag,prod,,,,,,,,,,,green,Production systems,,
+tag,office,,,,,,,,,,,color3,Office sites,,
+tag,prod,,,,,,,,,,,color4,Production systems,,
 application,custom-erp,Custom ERP app,,,,,,"{""member"": [""tcp""]}",8001,,,,,Enterprise-Business-Process,ERP
