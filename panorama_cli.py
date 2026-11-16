@@ -57,7 +57,7 @@ OBJECT_TYPES = [
 ]
 # Order in which object types are applied so references resolve (groups
 # reference addresses/services, objects reference tags).
-BUILD = "2026-11-14-fix10 (API key keyring: cache one key per Panorama host; --list-keys, per-host --renew-key)"
+BUILD = "2026-11-14-fix11 (snapshot ops: drop invalid <commands> wrapper from op cmds; more REST candidates)"
 APPLY_ORDER = ["tag", "application", "service", "service-group", "address",
                "address-group"]
 SHARED_LABEL = "(shared)"  # pseudo group for shared objects
@@ -813,13 +813,15 @@ class PanoramaClient:
 
     def create_snapshot(self, name: str, description: str = "") -> str:
         """Take a Panorama configuration snapshot; try REST commands first,
-        then the XML op equivalents. Returns the method that worked."""
+        then the XML op equivalents (op cmd trees have no <commands>
+        wrapper). Returns the method that worked."""
         entry = {"@name": name}
         if description:
             entry["description"] = description
         errs: list[str] = []
         for path in (f"{self.rest_base()}/Commands/Snapshot/Config",
-                     f"{self.rest_base()}/Commands/SnapshotConfig"):
+                     f"{self.rest_base()}/Commands/SnapshotConfig",
+                     f"{self.rest_base()}/Commands/Snapshot"):
             try:
                 self._rest("POST", path, {"panorama": "LocalDevice"},
                            {"entry": [entry]})
@@ -829,17 +831,17 @@ class PanoramaClient:
         desc = (f"<description>{escape(description)}</description>"
                 if description else "")
         for cmd in (
-                f"<commands><snapshot><config>"
+                f"<snapshot><config>"
                 f"<entry name=\"{escape(name)}\">{desc}</entry>"
-                f"</config></snapshot></commands>",
-                f"<commands><export><config>"
+                f"</config></snapshot>",
+                f"<export><config>"
                 f"<snapshot name=\"{escape(name)}\"/>"
-                f"</config></export></commands>"):
+                f"</config></export>"):
             try:
                 self._request({"type": "op", "cmd": cmd})
                 return "XML op " + cmd[:40] + "..."
             except RuntimeError as exc:
-                errs.append(f"XML op: {exc}")
+                errs.append(f"XML op <{cmd.split('>', 1)[0][1:]}>: {exc}")
         raise RuntimeError("; ".join(errs))
 
     def list_snapshots(self) -> list[dict]:
@@ -859,23 +861,28 @@ class PanoramaClient:
             rest_err = str(exc)
         else:
             return []
-        try:
-            result = self._request({"type": "op", "cmd":
-                                    "<commands><show><snapshot>"
-                                    "<config/></snapshot></show></commands>"})
-        except RuntimeError as exc:
-            raise RuntimeError(f"REST: {rest_err}; XML op: {exc}")
-        node = result
-        if isinstance(node, dict):
-            node = node.get("snapshot", node)
+        last: RuntimeError | None = None
+        for cmd in ("<show><snapshot/></show>",
+                    "<show><snapshot><config/></snapshot></show>",
+                    "<show><checkpoints/></show>"):
+            try:
+                result = self._request({"type": "op", "cmd": cmd})
+            except RuntimeError as exc:
+                last = exc
+                continue
+            node = result
             if isinstance(node, dict):
-                node = node.get("config", node)
-                entries = node.get("entry") if isinstance(node, dict) else None
-                if isinstance(entries, dict):
-                    entries = [entries]
-                if isinstance(entries, list):
-                    return [e for e in entries if isinstance(e, dict)]
-        return []
+                node = node.get("snapshot", node)
+                if isinstance(node, dict):
+                    node = node.get("config", node)
+                    entries = (node.get("entry")
+                               if isinstance(node, dict) else None)
+                    if isinstance(entries, dict):
+                        entries = [entries]
+                    if isinstance(entries, list):
+                        return [e for e in entries if isinstance(e, dict)]
+        raise RuntimeError(f"REST: {rest_err}"
+                           + (f"; XML op: {last}" if last else ""))
 
     def running_config(self) -> dict:
         """Fetch the full committed running config once and cache it.
