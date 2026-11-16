@@ -7,6 +7,21 @@ releases via fallbacks).
 
 Only Python 3.8+ and the `requests` library are required.
 
+## Supported PAN-OS versions
+
+| Platform | Status | Notes |
+|---|---|---|
+| **PAN-OS 12.1.x Panorama** | **Tested & supported** (12.1.10-h3) | All features work: browse/export/import/copy, where-used, CSV↔JSON convert, address-group add/remove, rule updates via REST `Policies/*{Pre,Post}Rules`, commits. On-device config snapshots are **UI-only** (API refuses them on this build; local dated export works). |
+| PAN-OS 12.0 Panorama | Expected to work (not tested) | Same REST v11 API surface; version is auto-probed. |
+| PAN-OS 11.x Panorama | Expected to work (not tested) | Falls back across XML API paths and REST v11/v10 endpoints; rule-edit endpoints (`/Policies/...`) must exist on the build - verify with `--diagnose`. |
+| PAN-OS 10.x Panorama | Best-effort (not tested) | XML API works; newer REST resources may be missing, so some operations rely on XML fallbacks or the CLI script. |
+| Firewalls / vsys (not Panorama) | Not supported | The tool targets Panorama's device-group layout and API parameters (`panorama=LocalDevice`). |
+
+The script auto-probes the REST API version (`v11.0` → `v12.0` → `v10.0`)
+and multiple candidate endpoints per operation, so behavior degrades
+gracefully on older/unusual builds - run `--diagnose` first to see what a
+given Panorama serves.
+
 > **Use at your own risk.** This tool reads and writes live Panorama
 > configuration (objects, address groups, and security rules) through the
 > Panorama API. Always review the before/after diffs, prefer leaving changes
