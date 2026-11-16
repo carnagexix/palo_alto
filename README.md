@@ -422,6 +422,5 @@ and members must be JSON, e.g. `{"member": ["office", "prod"]}`):
   this repo.
 - **ChatGPT** (OpenAI) - AI assistant; identified the correct Panorama REST
   policy endpoints (`/Policies/{Type}{Pre,Post}Rules`) and the
-  `localhost.localdomain` XML config path, wrote the offline
-  `test_panorama_rule_fix.py` suite, and contributed the direct-only
+  `localhost.localdomain` XML config path, and contributed the direct-only
   rule-match safety model.
