@@ -24,8 +24,11 @@ python panorama_cli.py --host <FQDN or IP of Panorama>
 ```
 
 First run prompts for username/password, generates an API key, and caches it
-in `.panorama_api_key` (chmod 600). Later runs reuse the cached key
-automatically.
+in the `.panorama_api_key` **keyring** (JSON, one entry per Panorama host,
+chmod 600) - so you can connect to several Panorama servers and each keeps
+its own cached key. `--list-keys` shows the cached hosts and dates;
+`--renew-key` replaces only the key for `--host`. Later runs reuse the
+matching cached key automatically.
 
 Interactive flow:
 
@@ -108,7 +111,8 @@ reachable/permitted before reporting "unauthorized" issues:
 | `--host` | Panorama IP/hostname (env: `PANORAMA_HOST`) |
 | `--user` / `--password` | admin credentials (env: `PANORAMA_USER` / `PANORAMA_PASSWORD`); password is prompted hidden if omitted |
 | `--output {text,json,csv}` | skip the Action menu and export directly; json/csv are saved to `<device_group>_<obj_type>.<ext>` in the current directory (spaces/special chars become underscores) |
-| `--renew-key` | delete the cached API key and generate a fresh one |
+| `--renew-key` | remove the cached API key **for `--host` only** and generate a fresh one |
+| `--list-keys` | list all Panorama hosts with a cached API key (with save dates) and exit |
 | `--debug` | print diagnostic API details to stderr (large configuration bodies are suppressed) |
 | `--diagnose` | run an API probe battery (op/config/REST) and dump raw responses - use this first when API access looks wrong |
 

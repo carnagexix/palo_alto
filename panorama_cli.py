@@ -57,7 +57,7 @@ OBJECT_TYPES = [
 ]
 # Order in which object types are applied so references resolve (groups
 # reference addresses/services, objects reference tags).
-BUILD = "2026-11-14-fix9 (new mode: config snapshots - save on Panorama, export local XML+JSON, list)"
+BUILD = "2026-11-14-fix10 (API key keyring: cache one key per Panorama host; --list-keys, per-host --renew-key)"
 APPLY_ORDER = ["tag", "application", "service", "service-group", "address",
                "address-group"]
 SHARED_LABEL = "(shared)"  # pseudo group for shared objects
@@ -105,29 +105,59 @@ def key_file_path() -> Path:
     return Path(__file__).resolve().parent / ".panorama_api_key"
 
 
-def save_api_key(host: str, key: str) -> None:
+def _load_keyring() -> dict:
+    """API keys cached per Panorama host: {host: {host, key, saved}}.
+    Migrates the legacy single-host file {host, key} automatically."""
+    path = key_file_path()
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if isinstance(data, dict) and "key" in data and "host" in data:
+        data = {data["host"]: {"host": data["host"], "key": data["key"]}}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_keyring(ring: dict) -> None:
     path = key_file_path()
     try:
-        path.write_text(json.dumps({"host": host, "key": key}))
+        path.write_text(json.dumps(ring, indent=2) + "\n")
         path.chmod(0o600)
     except OSError as exc:
-        print(f"warning: could not save API key to {path}: {exc}", file=sys.stderr)
+        print(f"warning: could not save API keys to {path}: {exc}",
+              file=sys.stderr)
+
+
+def save_api_key(host: str, key: str) -> None:
+    ring = _load_keyring()
+    ring[host] = {"host": host, "key": key,
+                  "saved": datetime.now().isoformat(timespec="seconds")}
+    _save_keyring(ring)
+
+
+def forget_api_key(host: str) -> None:
+    ring = _load_keyring()
+    if ring.pop(host, None) is not None:
+        _save_keyring(ring)
+    os.environ.pop("PANORAMA_API_KEY", None)
+
+
+def list_api_keys() -> list[tuple[str, str]]:
+    """(host, saved-date) for every cached API key, sorted by host."""
+    return sorted((host, entry.get("saved", "?"))
+                  for host, entry in _load_keyring().items()
+                  if isinstance(entry, dict) and entry.get("key"))
 
 
 def load_api_key(host: str) -> str | None:
-    # Environment variable wins, then cached file if it matches the host.
+    # Environment variable wins, then the cached key for this exact host.
     env_key = env_or_default("PANORAMA_API_KEY")
     if env_key:
         return env_key
-    path = key_file_path()
-    if path.exists():
-        try:
-            data = json.loads(path.read_text())
-            if data.get("host") == host:
-                return data.get("key")
-        except (OSError, json.JSONDecodeError):
-            return None
-    return None
+    entry = _load_keyring().get(host)
+    return entry.get("key") if isinstance(entry, dict) else None
 
 
 def _merge(container: dict, key: str, value) -> None:
@@ -235,8 +265,8 @@ class PanoramaClient:
             msg = root.findtext("msg") or resp.text[:200]
             hint = ""
             if code == "4":
-                hint = (" (API key may be invalid/expired - delete "
-                        ".panorama_api_key and re-run with credentials)")
+                hint = (" (API key may be invalid/expired - re-run with "
+                        "--renew-key to regenerate it)")
             raise RuntimeError(f"Panorama API error (code {code}): {msg}{hint}")
         result = root.find("result")
         return xml_to_obj(result) if result is not None else None
@@ -3084,13 +3114,26 @@ def main() -> None:
     parser.add_argument("--diagnose", action="store_true",
                         help="run API probes and dump raw responses to stderr")
     parser.add_argument("--renew-key", action="store_true",
-                        help="ignore/delete cached API key and generate a new one")
+                        help="remove the cached API key for --host and "
+                             "generate a new one")
+    parser.add_argument("--list-keys", action="store_true",
+                        help="list hosts with cached API keys and exit")
     parser.add_argument("--output", choices=("text", "json", "csv"),
                         default="text",
                         help="object listing format; json/csv are saved to "
                              "<device_group>_<obj_type>.<ext> in the CWD")
     args = parser.parse_args()
     print(f"panorama_cli.py build {BUILD}")
+
+    if args.list_keys:
+        saved = list_api_keys()
+        if not saved:
+            print("No cached API keys.")
+        else:
+            print(f"Cached API keys ({key_file_path()}):")
+            for host, saved_at in saved:
+                print(f"  {host}  (saved {saved_at})")
+        return
 
     if not args.host:
         if len(sys.argv) == 1:
@@ -3103,17 +3146,17 @@ def main() -> None:
 
     # 1. API key: reuse cached/env key, otherwise generate a new one.
     if args.renew_key:
-        try:
-            key_file_path().unlink()
-        except FileNotFoundError:
-            pass
-        os.environ.pop("PANORAMA_API_KEY", None)
+        forget_api_key(args.host)
         api_key = None
     else:
         api_key = load_api_key(args.host)
     if api_key:
         print(f"Using existing API key for {args.host}")
     else:
+        others = sorted(h for h in _load_keyring() if h != args.host)
+        if others:
+            print("(no cached key for this host; cached keys exist for: "
+                  f"{', '.join(others)})")
         if not args.user:
             args.user = input("Username: ").strip()
         if not args.password:
@@ -3123,7 +3166,7 @@ def main() -> None:
         print(f"Generating API key on {args.host} ...")
         api_key = fetch_api_key(args.host, args.user, args.password)
         save_api_key(args.host, api_key)
-        print("API key saved to .panorama_api_key")
+        print(f"API key for {args.host} saved to {key_file_path().name}")
 
     client = PanoramaClient(args.host, api_key, debug=args.debug)
 
