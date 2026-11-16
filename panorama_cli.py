@@ -2812,7 +2812,7 @@ def convert_mode() -> None:
 
 
 def _snap_name(raw: str) -> str:
-    return re.sub(r"[^\w.-]+", "_", raw).strip("_") or "snapshot"
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", raw).strip("_.-") or "snapshot"
 
 
 def _export_config_snapshot_locally(client: PanoramaClient, raw: str) -> None:
@@ -2855,7 +2855,7 @@ def snapshot_mode(client: PanoramaClient) -> None:
         raw = input("Snapshot name (base name, timestamp added): ").strip()
         raw = raw.strip('"').strip("'")
         base = raw[:-4] if raw.lower().endswith(".xml") else raw
-        name = (f"{_snap_name(base)}_"
+        name = (f"{_snap_name(base)[:108]}_"
                 f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.xml")
         print(f"Saving candidate configuration snapshot '{name}' on Panorama ...")
         try:
