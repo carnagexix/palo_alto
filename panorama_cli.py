@@ -818,7 +818,7 @@ class PanoramaClient:
         A description is not supported by this command; retained here for
         compatibility with older callers.
         """
-        if not name or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*\\.xml", name):
+        if not name or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*\.xml", name):
             raise ValueError("snapshot filename must be a safe .xml filename")
         if len(name) > 128:
             raise ValueError("snapshot filename is too long (maximum 128 chars)")
