@@ -57,7 +57,7 @@ OBJECT_TYPES = [
 ]
 # Order in which object types are applied so references resolve (groups
 # reference addresses/services, objects reference tags).
-BUILD = "2026-11-14-fix11 (snapshot ops: drop invalid <commands> wrapper from op cmds; more REST candidates)"
+BUILD = "2026-11-14-fix12 (converter: input-file prompt shows the source extension, not the target)"
 APPLY_ORDER = ["tag", "application", "service", "service-group", "address",
                "address-group"]
 SHARED_LABEL = "(shared)"  # pseudo group for shared objects
@@ -2803,8 +2803,9 @@ def convert_mode() -> None:
     action = choose(actions, "Conversion")
     if action == actions[2]:
         return
-    want_ext = ".json" if action == actions[0] else ".csv"
-    src = input(f"Input file ({want_ext}): ").strip().strip('"').strip("'")
+    want_ext = ".json" if action == actions[0] else ".csv"   # output
+    in_ext = ".csv" if action == actions[0] else ".json"     # input
+    src = input(f"Input file ({in_ext}): ").strip().strip('"').strip("'")
     if not src:
         return
     if not Path(src).is_file():
