@@ -76,12 +76,12 @@
   "tag": [
     {
       "name": "office",
-      "color": "blue",
+      "color": "color3",
       "comments": "Office sites"
     },
     {
       "name": "prod",
-      "color": "green",
+      "color": "color4",
       "comments": "Production systems"
     }
   ],
