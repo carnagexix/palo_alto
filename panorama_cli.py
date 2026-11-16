@@ -57,7 +57,7 @@ OBJECT_TYPES = [
 ]
 # Order in which object types are applied so references resolve (groups
 # reference addresses/services, objects reference tags).
-BUILD = "2026-11-14-fix12 (converter: input-file prompt shows the source extension, not the target)"
+BUILD = "2026-11-14-fix13 (snapshots: cache unsupported state, concise reason, auto-offer local dated snapshot fallback)"
 APPLY_ORDER = ["tag", "application", "service", "service-group", "address",
                "address-group"]
 SHARED_LABEL = "(shared)"  # pseudo group for shared objects
@@ -811,10 +811,20 @@ class PanoramaClient:
             return resp.text
         return ET.tostring(result, encoding="unicode")
 
+    def _snapshot_api_unsupported(self) -> bool:
+        return getattr(self, "_snap_unsupported", False)
+
+    def _mark_snapshot_api_unsupported(self, reason: str) -> None:
+        self._snap_unsupported = True
+        self._snap_reason = reason
+
     def create_snapshot(self, name: str, description: str = "") -> str:
         """Take a Panorama configuration snapshot; try REST commands first,
         then the XML op equivalents (op cmd trees have no <commands>
         wrapper). Returns the method that worked."""
+        if self._snapshot_api_unsupported():
+            raise RuntimeError(getattr(self, "_snap_reason",
+                                       "snapshots not exposed via API"))
         entry = {"@name": name}
         if description:
             entry["description"] = description
@@ -842,10 +852,20 @@ class PanoramaClient:
                 return "XML op " + cmd[:40] + "..."
             except RuntimeError as exc:
                 errs.append(f"XML op <{cmd.split('>', 1)[0][1:]}>: {exc}")
-        raise RuntimeError("; ".join(errs))
+        reason = ("this Panorama does not expose configuration snapshots "
+                  "through the API (REST snapshot routes are not served and "
+                  "the op export command is refused for API clients). "
+                  "Use 'export configuration locally' instead, or take "
+                  "snapshots in the Panorama UI.")
+        if all(("501" in e or "code 17" in e) for e in errs):
+            self._mark_snapshot_api_unsupported(reason)
+        raise RuntimeError(reason + "  Details: " + "; ".join(errs))
 
     def list_snapshots(self) -> list[dict]:
         """List saved configuration snapshots (best-effort probe)."""
+        if self._snapshot_api_unsupported():
+            raise RuntimeError(getattr(self, "_snap_reason",
+                                       "snapshots not exposed via API"))
         try:
             data = self._rest("GET",
                               f"{self.rest_base()}/Commands/Snapshot/Config",
@@ -862,6 +882,7 @@ class PanoramaClient:
         else:
             return []
         last: RuntimeError | None = None
+        op_errs: list[str] = []
         for cmd in ("<show><snapshot/></show>",
                     "<show><snapshot><config/></snapshot></show>",
                     "<show><checkpoints/></show>"):
@@ -869,6 +890,7 @@ class PanoramaClient:
                 result = self._request({"type": "op", "cmd": cmd})
             except RuntimeError as exc:
                 last = exc
+                op_errs.append(str(exc))
                 continue
             node = result
             if isinstance(node, dict):
@@ -881,6 +903,12 @@ class PanoramaClient:
                         entries = [entries]
                     if isinstance(entries, list):
                         return [e for e in entries if isinstance(e, dict)]
+        if ("501" in rest_err and op_errs
+                and all("code 17" in e for e in op_errs)):
+            self._mark_snapshot_api_unsupported(
+                "this Panorama does not expose configuration snapshots "
+                "through the API; saved snapshots cannot be listed or "
+                "downloaded via API on this build")
         raise RuntimeError(f"REST: {rest_err}"
                            + (f"; XML op: {last}" if last else ""))
 
@@ -2837,6 +2865,32 @@ def _snap_name(raw: str) -> str:
     return re.sub(r"[^\w.-]+", "_", raw).strip("_") or "snapshot"
 
 
+def _export_config_snapshot_locally(client: PanoramaClient, raw: str) -> None:
+    """Fetch the committed config and save a dated local snapshot
+    (XML + JSON)."""
+    name = _snap_name(raw) if raw else "running-config"
+    print("Fetching committed configuration ...")
+    try:
+        xml_text = client.config_show_raw()
+    except (RuntimeError, requests.RequestException) as exc:
+        print(f"  Export failed: {exc}", file=sys.stderr)
+        return
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    xml_path = safe_filename("snapshot", f"{name}_{ts}", "xml")
+    json_path = safe_filename("snapshot", f"{name}_{ts}", "json")
+    Path(xml_path).write_text(xml_text, encoding="utf-8")
+    try:
+        parsed = client.running_config()
+        Path(json_path).write_text(
+            json.dumps(parsed, indent=2, ensure_ascii=False),
+            encoding="utf-8")
+        print(f"Saved config snapshot '{name}' ({len(xml_text):,} bytes) to:\n"
+              f"  {xml_path}\n  {json_path}")
+    except (OSError, RuntimeError) as exc:
+        print(f"  XML saved ({xml_path}); JSON failed: {exc}",
+              file=sys.stderr)
+
+
 def snapshot_mode(client: PanoramaClient) -> None:
     """Save/list/export Panorama configuration snapshots (dated names)."""
     actions = ["save configuration snapshot on Panorama",
@@ -2855,9 +2909,14 @@ def snapshot_mode(client: PanoramaClient) -> None:
         try:
             via = client.create_snapshot(name, comment)
         except RuntimeError as exc:
-            print(f"  Snapshot save failed: {exc}", file=sys.stderr)
-            print("  (Check role/API access; run with --debug to inspect "
-                  "the exact responses.)", file=sys.stderr)
+            print(f"  {exc}", file=sys.stderr)
+            if client._snapshot_api_unsupported():
+                print("  Panorama-side snapshots are unavailable through "
+                      "this API.", file=sys.stderr)
+                if input("  Save the snapshot locally instead (dated "
+                         "XML + JSON export)? y/Enter=cancel: "
+                         ).strip().lower() == "y":
+                    _export_config_snapshot_locally(client, raw)
             return
         print(f"Snapshot '{name}' saved via {via}.")
         return
@@ -2865,27 +2924,7 @@ def snapshot_mode(client: PanoramaClient) -> None:
     if action == actions[1]:
         raw = input("Name for the local export (Enter = running-config): ") \
             .strip().strip('"').strip("'")
-        name = _snap_name(raw) if raw else "running-config"
-        print("Fetching committed configuration ...")
-        try:
-            xml_text = client.config_show_raw()
-        except (RuntimeError, requests.RequestException) as exc:
-            print(f"  Export failed: {exc}", file=sys.stderr)
-            return
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        xml_path = safe_filename("snapshot", f"{name}_{ts}", "xml")
-        json_path = safe_filename("snapshot", f"{name}_{ts}", "json")
-        Path(xml_path).write_text(xml_text, encoding="utf-8")
-        try:
-            parsed = client.running_config()
-            Path(json_path).write_text(
-                json.dumps(parsed, indent=2, ensure_ascii=False),
-                encoding="utf-8")
-            print(f"Exported config snapshot '{name}' ({len(xml_text):,} "
-                  f"bytes) to:\n  {xml_path}\n  {json_path}")
-        except (OSError, RuntimeError) as exc:
-            print(f"  XML saved ({xml_path}); JSON failed: {exc}",
-                  file=sys.stderr)
+        _export_config_snapshot_locally(client, raw)
         return
 
     if action == actions[2]:
@@ -2893,7 +2932,7 @@ def snapshot_mode(client: PanoramaClient) -> None:
         try:
             entries = client.list_snapshots()
         except RuntimeError as exc:
-            print(f"  Could not list snapshots: {exc}", file=sys.stderr)
+            print(f"  {exc}", file=sys.stderr)
             return
         if not entries:
             print("  No snapshots found (or this Panorama does not expose "

@@ -57,6 +57,13 @@ Snapshots       -> [1] save configuration snapshot on Panorama
                    `YYYYMMDD_HHMMSS` date stamp. The local export downloads
                    the committed configuration through the API and writes
                    `snapshot_<name>_<date>.xml` and `.json` locally.
+                   NOTE: some Panorama builds (verified on 12.1.10-h3) do
+                   not expose snapshot creation/listing to API clients at
+                   all (REST routes not served; the op `export` command is
+                   refused with "export not available to xmlapi client").
+                   The script detects this once, explains it, and offers to
+                   save the dated snapshot locally instead; take on-device
+                   snapshots in the Panorama UI if you need them server-side.
 ```
 
 Both menus repeat after each action/pass, so you can browse, export, import,
@@ -100,7 +107,10 @@ reachable/permitted before reporting "unauthorized" issues:
     (rule updates are REST `PUT`; XML `action=edit` is the fallback)
   - commits: `Commit`
   - config snapshots: `Commands/Snapshot/Config` (XML `op
-    <snapshot><config>` fallback)
+    <snapshot><config>` fallback). **Availability varies by build**: on
+    PAN-OS 12.1.10-h3 the snapshot routes are not served and op `export`
+    is refused for API clients, so server-side snapshots are UI-only
+    there; the local export option works everywhere.
   If a route answers `501 Route Not Found`, that Panorama build does not
   serve that resource - the script falls back to the XML API where possible.
 
