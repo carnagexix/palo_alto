@@ -56,7 +56,7 @@ OBJECT_TYPES = [
 ]
 # Order in which object types are applied so references resolve (groups
 # reference addresses/services, objects reference tags).
-BUILD = "2026-11-14-fix7 (generic recursive device-group discovery; removed org-specific group names; README disclaimer + authors)"
+BUILD = "2026-11-14-fix8 (new mode: convert object files CSV <-> JSON)"
 APPLY_ORDER = ["tag", "application", "service", "service-group", "address",
                "address-group"]
 SHARED_LABEL = "(shared)"  # pseudo group for shared objects
@@ -2626,6 +2626,86 @@ def revert_move(client: PanoramaClient, device_group: str, obj_type: str,
         commit_changes(client)
 
 
+def _write_converted(groups: dict[str, list[dict]], out_path: str,
+                     to_json: bool) -> int:
+    """Write grouped object entries to JSON ({type: [entry,...]}) or to a
+    single CSV with a leading type column. Returns the entry count."""
+    total = sum(len(entries) for entries in groups.values())
+    if to_json:
+        if list(groups) == [""]:
+            payload = groups[""]
+        else:
+            payload = {k: groups[k] for k in groups}
+        Path(out_path).write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8")
+        return total
+    keys: list[str] = ["type", "name"]
+    for entries in groups.values():
+        for entry in entries:
+            for key in entry:
+                if key not in keys:
+                    keys.append(key)
+    with open(out_path, "w", encoding="utf-8", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(keys)
+        for obj_type, entries in groups.items():
+            for entry in entries:
+                row = [obj_type] + [fmt_value(entry.get(key))
+                                    for key in keys[1:]]
+                writer.writerow(row)
+    return total
+
+
+def _convert_file(src: str, dst: str) -> None:
+    groups = read_import_file(src)
+    if not any(groups.values()):
+        print("  No object entries found in the file.")
+        return
+    to_json = dst.lower().endswith(".json")
+    total = _write_converted(groups, dst, to_json)
+    types = [k for k in groups if k]
+    print(f"Converted {total} object(s)"
+          + (f" ({', '.join(sorted(types))})" if types else "")
+          + f" -> {dst}")
+
+
+def convert_mode() -> None:
+    """Standalone CSV <-> JSON converter for object import/export files."""
+    actions = ["convert CSV to JSON", "convert JSON to CSV",
+               "back to main menu"]
+    action = choose(actions, "Conversion")
+    if action == actions[2]:
+        return
+    want_ext = ".json" if action == actions[0] else ".csv"
+    src = input(f"Input file ({want_ext}): ").strip().strip('"').strip("'")
+    if not src:
+        return
+    if not Path(src).is_file():
+        print(f"  File not found: {src}")
+        return
+    if not src.lower().endswith((".csv", ".json")):
+        print("  Input must be a .csv or .json file.")
+        return
+    if src.lower().endswith(want_ext):
+        print(f"  NOTE: input is already {want_ext}; converting anyway "
+              "by content.")
+    default = str(Path(src).with_suffix(want_ext))
+    dst = input(f"Output file (Enter for '{default}'): ").strip() \
+        .strip('"').strip("'") or default
+    if not dst.lower().endswith((".csv", ".json")):
+        dst += want_ext
+    if Path(dst).exists() and input(
+            f"'{dst}' exists - overwrite? y/Enter=cancel: ").strip().lower() \
+            != "y":
+        print("Conversion cancelled.")
+        return
+    try:
+        _convert_file(src, dst)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"  Conversion failed: {exc}", file=sys.stderr)
+
+
 def _names_from_convert_file(path: str) -> list[str]:
     names: list[str] = []
     text = Path(path).read_text(encoding="utf-8", errors="replace")
@@ -2894,6 +2974,7 @@ def main() -> None:
     client.running_config()
     modes = ["explore device-group objects (browse/export/import/copy)",
              "find where an object is used (rule search)",
+             "convert object files (CSV <-> JSON)",
              "quit"]
     while True:
         if args.output == "text":
@@ -2905,6 +2986,8 @@ def main() -> None:
             return
         if mode.startswith("find "):
             where_used(client)
+        elif mode.startswith("convert "):
+            convert_mode()
         else:
             explore_objects(client, args)
         if args.output != "text":

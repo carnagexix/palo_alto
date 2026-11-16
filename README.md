@@ -31,13 +31,21 @@ Interactive flow:
 
 ```
 Mode            -> [1] explore device-group objects   [2] find where an object is used
-                   [3] quit
+                   [3] convert object files (CSV <-> JSON)   [4] quit
 Mode 1 (explore):
 Device groups   -> pick one (number), or "(shared)" for shared objects
 Action          -> [1] list objects   [2] export CSV/JSON   [3] import CSV/JSON
                    [4] copy/move object(s) to shared   (only for device groups)
                    [last] back to mode menu            (number varies)
 Object types    -> pick one (address, service, ...)
+Mode 3 (convert):
+Conversion      -> [1] convert CSV to JSON   [2] convert JSON to CSV
+                   then: input file, output file (Enter = same name, other
+                   extension), overwrite confirmation. Files use the same
+                   format as exports/imports: JSON is `{ "<type>": [...] }`
+                   (or a plain list when no type column exists), CSV has a
+                   leading `type` column; nested values (tags, members) are
+                   embedded as JSON. Round-trip CSV -> JSON -> CSV is lossless.
 ```
 
 Both menus repeat after each action/pass, so you can browse, export, import,
