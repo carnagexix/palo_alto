@@ -95,20 +95,20 @@ class SnapshotTests(unittest.TestCase):
     def test_save_menu_adds_timestamp_and_xml_suffix(self):
         self.client.create_snapshot = Mock(return_value="XML operational API")
         with patch.object(p, "choose", return_value=(
-                "save configuration snapshot on Panorama")), \\
-                patch("builtins.input", return_value="my backups.xml"), \\
+                "save configuration snapshot on Panorama")), \
+                patch("builtins.input", return_value="my backups.xml"), \
                 redirect_stdout(io.StringIO()):
             p.snapshot_mode(self.client)
         name = self.client.create_snapshot.call_args.args[0]
-        self.assertRegex(name, r"^my_backups_\\d{8}_\\d{6}\\.xml$")
+        self.assertRegex(name, r"^my_backups_\d{8}_\d{6}\.xml$")
 
     def test_save_error_offers_local_export(self):
         self.client.create_snapshot = Mock(
             side_effect=RuntimeError("Panorama API error (code 16)"))
         with patch.object(p, "choose", return_value=(
-                "save configuration snapshot on Panorama")), \\
-                patch("builtins.input", side_effect=["backup", "y"]), \\
-                patch.object(p, "_export_config_snapshot_locally") as export, \\
+                "save configuration snapshot on Panorama")), \
+                patch("builtins.input", side_effect=["backup", "y"]), \
+                patch.object(p, "_export_config_snapshot_locally") as export, \
                 redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             p.snapshot_mode(self.client)
         export.assert_called_once_with(self.client, "backup")
@@ -121,7 +121,7 @@ class SnapshotTests(unittest.TestCase):
         ])
         output = io.StringIO()
         with patch.object(p, "choose",
-                          return_value="list snapshots saved on Panorama"), \\
+                          return_value="list snapshots saved on Panorama"), \
                 redirect_stdout(output):
             p.snapshot_mode(self.client)
         text = output.getvalue()
