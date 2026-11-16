@@ -25,3 +25,7 @@ __pycache__/
 # ad-hoc test exports
 *.csv.tmp
 1234.*
+
+# locally exported Panorama configuration backups (sensitive)
+snapshot_*.xml
+snapshot_*.json
