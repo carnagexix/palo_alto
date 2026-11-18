@@ -57,7 +57,7 @@ OBJECT_TYPES = [
 ]
 # Order in which object types are applied so references resolve (groups
 # reference addresses/services, objects reference tags).
-BUILD = "2026-11-16-fix16 (REST proxy fallback: discover allowed 'type' enum from proxy OpenAPI spec; retry alt types on 'Illegal value'; diagnose probes spec + enums)"
+BUILD = "2026-11-18-fix17 (Mode 1: documented REST Objects listing; safe empty-scope handling)"
 APPLY_ORDER = ["tag", "application", "service", "service-group", "address",
                "address-group"]
 SHARED_LABEL = "(shared)"  # pseudo group for shared objects
@@ -525,6 +525,79 @@ class PanoramaClient:
         if cached and cached[1]:
             return [pano, plain]
         return [plain, pano]
+
+    def rest_list_objects(self, obj_type: str,
+                          device_group: str) -> list[dict]:
+        """List objects directly owned by a scope using the documented REST API.
+
+        Unlike /api/rest/v13/<type> (an incompatible proxy route),
+        /restapi/v11.0/Objects/<resource> uses location/device-group, not
+        a required object subtype query parameter. Only top-level entry
+        records are returned; nested tag/member data are not extra objects.
+        """
+        resource = REST_RESOURCES.get(obj_type)
+        if resource is None:
+            raise ValueError(f"REST listing not supported for {obj_type!r}")
+        endpoint = f"{self.rest_base()}/{resource}"
+        params = self._rest_location(device_group)
+        # Some Panorama builds require panorama=LocalDevice, others reject it.
+        attempts = self._rest_location_attempts(device_group, params)
+        errors: list[str] = []
+        saw_empty_response = False
+        for scope in attempts:
+            entries: list[dict] = []
+            seen: set[str] = set()
+            try:
+                for page_no in range(40):
+                    limit = 500
+                    query = {**scope, "limit": limit,
+                             "offset": page_no * limit}
+                    data = self._rest("GET", endpoint, query)
+                    result = data.get("result", data)
+                    if not isinstance(result, dict):
+                        raise RuntimeError(
+                            f"unexpected REST {obj_type} result format")
+                    raw = result.get("entry") or []
+                    if isinstance(raw, dict):
+                        raw = [raw]
+                    if not isinstance(raw, list):
+                        raise RuntimeError(
+                            f"unexpected REST {obj_type} entry format")
+                    new_entries = 0
+                    for entry in raw:
+                        if not isinstance(entry, dict):
+                            continue
+                        name = entry.get("@name") or entry.get("name")
+                        if not name or name in seen:
+                            continue
+                        seen.add(name)
+                        entries.append({
+                            "name": name,
+                            **{k: v for k, v in entry.items()
+                               if k != "name" and not k.startswith("@")}
+                        })
+                        new_entries += 1
+                    if raw and not new_entries:
+                        raise RuntimeError(
+                            f"REST {obj_type} pagination returned duplicate "
+                            f"entries at offset {page_no * limit}")
+                    if len(raw) < limit:
+                        break
+                else:
+                    raise RuntimeError(
+                        f"REST {obj_type} listing exceeded 20,000 items")
+            except RuntimeError as exc:
+                errors.append(str(exc))
+                continue
+            if entries:
+                return entries
+            saw_empty_response = True
+        if saw_empty_response:
+            return []
+        raise RuntimeError(
+            f"REST {obj_type} listing failed for {device_group!r}: "
+            + "; ".join(errors))
+
 
     def rest_get_entry(self, obj_type: str, device_group: str,
                        name: str) -> dict | None:
@@ -1171,73 +1244,25 @@ def list_device_groups(client: PanoramaClient) -> list[str]:
         "target the real path.")
 
 
-# The PAN-OS 12 REST proxy (/api/rest/v13/<resource>) requires a 'type'
-# query parameter for these resources. The authoritative list is the enum
-# in the proxy's own OpenAPI spec (v13_type_values); these are fallbacks
-# used when the spec is not served, and _V13_TYPES_ALT is retried when
-# every primary type is rejected with "Illegal value".
-_V13_TYPES = {
-    "address": ["ip-netmask", "ip-range", "fqdn", "group"],
-    "address-group": ["static", "dynamic"],
-    "service": ["tcp", "udp"],
-    "service-group": ["static"],
-}
-_V13_TYPES_ALT = {
-    "address": ["static", "dynamic", "interface", "group"],
-}
-
-
 def get_device_group_objects(client: PanoramaClient, device_group: str,
                              obj_type: str) -> list[dict]:
+    """List objects defined in this device group (or Shared), not inherited.
+
+    Prefer the committed XML config tree. If the scope is empty/missing there,
+    use the documented Panorama REST Objects endpoint to distinguish a real
+    empty scope from an incomplete XML view. Never guess v13 'type' enums.
+    """
     dg = find_device_group(client, device_group)
-    entries = as_entry_list(dig(dg, obj_type)) if dg is not None else None
+    entries = as_entry_list(dig(dg, obj_type)) if dg is not None else []
     if entries:
         return entries
-    if device_group == SHARED_LABEL:
-        return []
-    # Fall back to the modern REST proxy API (PAN-OS 12 layout differences).
-    base = {"panorama": "LocalDevice", "device-group": device_group}
-    merged: list[dict] = []
-    seen: set[str] = set()
-
-    def attempt(types: list) -> list[str]:
-        errs: list[str] = []
-        for t in types:
-            params = dict(base)
-            if t:
-                params["type"] = t
-            try:
-                page = rest_paged(client, obj_type, params)
-            except RuntimeError as exc:
-                errs.append(f"type={t}: {exc}" if t else str(exc))
-                continue
-            for e in page:
-                key = str(e.get("name", id(e)))
-                if key not in seen:
-                    seen.add(key)
-                    merged.append(e)
-        return errs
-
-    types = (client.v13_type_values(obj_type)
-             or _V13_TYPES.get(obj_type) or [None])
-    v13_errors = attempt(types)
-    if (not merged and v13_errors and not client.v13_spec()
-            and obj_type in _V13_TYPES_ALT
-            and all("llegal value" in e for e in v13_errors)):
-        v13_errors = attempt(_V13_TYPES_ALT[obj_type])
-    if merged:
-        return merged
-    if v13_errors:
-        print(f"  XML config tree had no {obj_type} entries for "
-              f"'{device_group}'; REST fallback also failed:",
-              file=sys.stderr)
-        for err in v13_errors[:4]:
-            print(f"    {err}", file=sys.stderr)
-        if not client.v13_spec():
-            print("    hint: no OpenAPI spec served by the proxy; run "
-                  "'--diagnose' to probe it and its allowed type values",
-                  file=sys.stderr)
-    return entries or []
+    try:
+        return client.rest_list_objects(obj_type, device_group)
+    except (RuntimeError, requests.RequestException) as exc:
+        raise RuntimeError(
+            f"Unable to confirm {obj_type} objects for '{device_group}'. "
+            f"XML returned no local entries, and REST lookup failed: {exc}"
+        ) from exc
 
 
 def find_device_group(client: PanoramaClient, device_group: str) -> dict | None:
@@ -1611,10 +1636,13 @@ def import_objects(client: PanoramaClient, device_group: str) -> None:
     print("\nSnapshotting current state of target objects ...")
     existing: dict[str, dict] = {}
     for obj_type, entries in groups.items():
-        names_map = {e["name"]: e for e in
-                     get_device_group_objects(client, device_group, obj_type)
-                     if e.get("name")}
-        existing[obj_type] = names_map
+        try:
+            current = get_device_group_objects(client, device_group, obj_type)
+        except (RuntimeError, requests.RequestException) as exc:
+            print(f"Cannot safely import without reading existing "
+                  f"{obj_type} objects: {exc}", file=sys.stderr)
+            return
+        existing[obj_type] = {e["name"]: e for e in current if e.get("name")}
 
     total = sum(len(v) for v in groups.values())
     print(f"\nWill CREATE/OVERWRITE {total} object(s) in '{device_group}':")
@@ -1698,9 +1726,18 @@ def safe_filename(device_group: str, obj_type: str, ext: str) -> str:
 
 def print_objects(client: PanoramaClient, device_group: str, obj_type: str,
                   out_fmt: str = "text") -> None:
-    entries = get_device_group_objects(client, device_group, obj_type)
+    try:
+        entries = get_device_group_objects(client, device_group, obj_type)
+    except (RuntimeError, requests.RequestException) as exc:
+        print(f"Unable to list {obj_type} objects in '{device_group}': "
+              f"{exc}", file=sys.stderr)
+        return
     if not entries:
-        print(f"No {obj_type} objects found in device group '{device_group}'.")
+        print(f"No locally defined {obj_type} objects found in "
+              f"'{device_group}'.")
+        if device_group != SHARED_LABEL:
+            print("  Objects inherited from Shared or ancestor device "
+                  "groups are not included in this scope-only listing.")
         return
 
     if out_fmt in ("json", "csv"):
@@ -3095,9 +3132,14 @@ def _copy_move_pass(client: PanoramaClient, device_group: str,
     modes = ["copy (keep object in device group)",
              "move (delete device-group object after copying)"]
     mode = choose(modes, "Mode").split()[0].lower()
-    entries = get_device_group_objects(client, device_group, obj_type)
+    try:
+        entries = get_device_group_objects(client, device_group, obj_type)
+    except (RuntimeError, requests.RequestException) as exc:
+        print(f"Cannot safely copy/move objects: {exc}", file=sys.stderr)
+        return
     if not entries:
-        print(f"No '{obj_type}' objects found in '{device_group}'.")
+        print(f"No locally defined '{obj_type}' objects found in "
+              f"'{device_group}'.")
         return
     print(f"\n'{obj_type}' objects in '{device_group}':")
     for i, entry in enumerate(entries, start=1):
