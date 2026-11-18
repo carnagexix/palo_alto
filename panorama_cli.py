@@ -57,7 +57,7 @@ OBJECT_TYPES = [
 ]
 # Order in which object types are applied so references resolve (groups
 # reference addresses/services, objects reference tags).
-BUILD = "2026-11-16-fix14 (snapshots: XML save config, op-completion snapshot listing)"
+BUILD = "2026-11-16-fix15 (REST proxy fallback: send required 'type' param per resource; surface fallback errors instead of silent empty)"
 APPLY_ORDER = ["tag", "application", "service", "service-group", "address",
                "address-group"]
 SHARED_LABEL = "(shared)"  # pseudo group for shared objects
@@ -1100,6 +1100,16 @@ def list_device_groups(client: PanoramaClient) -> list[str]:
         "target the real path.")
 
 
+# The PAN-OS 12 REST proxy (/api/rest/v13/<resource>) requires a 'type'
+# query parameter for these resources.
+_V13_TYPES = {
+    "address": ["ip-netmask", "ip-range", "fqdn", "group"],
+    "address-group": ["static", "dynamic"],
+    "service": ["tcp", "udp"],
+    "service-group": ["static"],
+}
+
+
 def get_device_group_objects(client: PanoramaClient, device_group: str,
                              obj_type: str) -> list[dict]:
     dg = find_device_group(client, device_group)
@@ -1108,12 +1118,35 @@ def get_device_group_objects(client: PanoramaClient, device_group: str,
         return entries
     if device_group == SHARED_LABEL:
         return []
-    # Fall back to the modern REST API (older Panorama schemas).
-    try:
-        return rest_paged(client, obj_type,
-                          {"panorama": "LocalDevice", "device-group": device_group})
-    except RuntimeError:
-        return entries or []
+    # Fall back to the modern REST proxy API (PAN-OS 12 layout differences).
+    base = {"panorama": "LocalDevice", "device-group": device_group}
+    v13_errors: list[str] = []
+    merged: list[dict] = []
+    seen: set[str] = set()
+    types = _V13_TYPES.get(obj_type) or [None]
+    for t in types:
+        params = dict(base)
+        if t:
+            params["type"] = t
+        try:
+            page = rest_paged(client, obj_type, params)
+        except RuntimeError as exc:
+            v13_errors.append(f"type={t}: {exc}" if t else str(exc))
+            continue
+        for e in page:
+            key = str(e.get("name", id(e)))
+            if key not in seen:
+                seen.add(key)
+                merged.append(e)
+    if merged:
+        return merged
+    if v13_errors:
+        print(f"  XML config tree had no {obj_type} entries for "
+              f"'{device_group}'; REST fallback also failed:",
+              file=sys.stderr)
+        for err in v13_errors[:4]:
+            print(f"    {err}", file=sys.stderr)
+    return entries or []
 
 
 def find_device_group(client: PanoramaClient, device_group: str) -> dict | None:
