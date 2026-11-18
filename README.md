@@ -80,6 +80,22 @@ Snapshots       -> [1] save named candidate-configuration snapshot on Panorama
 
 ```
 
+### Mode 1: listing objects by device group
+
+Mode 1 lists **objects defined directly in the selected device group** (or
+directly in Shared). Panorama's web UI can also show objects inherited from
+Shared or parent device groups; those inherited objects are **not included**
+in this scope-only list, export, or copy/move selection. Select Shared or the
+parent device group to inspect objects defined there. This prevents an
+inherited object from being copied, moved, or overwritten as if it were local.
+
+For a selected group with no XML object entries, the CLI now checks the
+documented Panorama REST resource, such as
+`/restapi/v11.0/Objects/Addresses?location=device-group&device-group=SIIG`.
+It does **not** guess the incompatible `/api/rest/v13/address?type=...`
+subtypes. An API error is displayed separately from a confirmed empty
+scope, and imports/copy/move stop safely if existing objects cannot be read.
+
 Both menus repeat after each action/pass, so you can browse, export, import,
 convert and run rule searches as often as you want per session before
 quitting. `--output json/csv` is a one-shot export.
