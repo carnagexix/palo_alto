@@ -57,7 +57,7 @@ OBJECT_TYPES = [
 ]
 # Order in which object types are applied so references resolve (groups
 # reference addresses/services, objects reference tags).
-BUILD = "2026-11-16-fix15 (REST proxy fallback: send required 'type' param per resource; surface fallback errors instead of silent empty)"
+BUILD = "2026-11-16-fix16 (REST proxy fallback: discover allowed 'type' enum from proxy OpenAPI spec; retry alt types on 'Illegal value'; diagnose probes spec + enums)"
 APPLY_ORDER = ["tag", "application", "service", "service-group", "address",
                "address-group"]
 SHARED_LABEL = "(shared)"  # pseudo group for shared objects
@@ -912,6 +912,77 @@ class PanoramaClient:
             raise RuntimeError(f"REST v13 {resource} (HTTP {resp.status_code}): {msg}")
         return data
 
+    _V13_SPEC_PATHS = ("/api/rest/v13/openapi.json",
+                       "/api/rest/v13/swagger.json",
+                       "/api/rest/v13/v2/api-docs",
+                       "/api/rest/v13/spec")
+
+    def v13_get(self, path: str, params: dict | None = None):
+        """Raw GET against a REST proxy path; returns parsed JSON."""
+        query = {"key": self.api_key}
+        query.update(params or {})
+        url = f"https://{self.host}{path}"
+        resp = self.session.get(url, params=query, timeout=self.timeout,
+                                verify=False,
+                                headers={"Accept": "application/json"})
+        if self.debug:
+            safe = {k: ("<redacted>" if k == "key" else v)
+                    for k, v in query.items()}
+            print(f"GET {url}", file=sys.stderr)
+            print(f"params: {safe}", file=sys.stderr)
+            print(f"HTTP {resp.status_code}", file=sys.stderr)
+            print(resp.text[:500], file=sys.stderr)
+        try:
+            return resp.json()
+        except ValueError:
+            raise RuntimeError(
+                f"v13 {path} (HTTP {resp.status_code}): not JSON")
+
+    def v13_spec(self):
+        """Fetch/cache the REST proxy OpenAPI spec (None when absent)."""
+        if hasattr(self, "_v13_spec_data"):
+            return self._v13_spec_data
+        spec = None
+        for path in self._V13_SPEC_PATHS:
+            try:
+                data = self.v13_get(path)
+            except RuntimeError:
+                continue
+            if isinstance(data, dict) and data.get("paths"):
+                spec = data
+                break
+        self._v13_spec_data = spec
+        return spec
+
+    def v13_type_values(self, resource: str) -> list[str]:
+        """Allowed values of the 'type' query parameter for a resource,
+        discovered from the proxy's own OpenAPI spec."""
+        spec = self.v13_spec()
+        if not spec:
+            return []
+        item = next((v for k, v in (spec.get("paths") or {}).items()
+                     if k.rstrip("/").endswith("/" + resource)), None)
+        if item is None:
+            return []
+        found: list[str] = []
+
+        def walk(node):
+            if isinstance(node, dict):
+                if node.get("name") == "type":
+                    enum = node.get("enum")
+                    if not enum and isinstance(node.get("schema"), dict):
+                        enum = node["schema"].get("enum")
+                    if isinstance(enum, list):
+                        found.extend(str(e) for e in enum)
+                for value in node.values():
+                    walk(value)
+            elif isinstance(node, list):
+                for value in node:
+                    walk(value)
+
+        walk(item)
+        return list(dict.fromkeys(found))
+
 
 # --------------------------------------------------------------------------- #
 # API key retrieval
@@ -1101,12 +1172,18 @@ def list_device_groups(client: PanoramaClient) -> list[str]:
 
 
 # The PAN-OS 12 REST proxy (/api/rest/v13/<resource>) requires a 'type'
-# query parameter for these resources.
+# query parameter for these resources. The authoritative list is the enum
+# in the proxy's own OpenAPI spec (v13_type_values); these are fallbacks
+# used when the spec is not served, and _V13_TYPES_ALT is retried when
+# every primary type is rejected with "Illegal value".
 _V13_TYPES = {
     "address": ["ip-netmask", "ip-range", "fqdn", "group"],
     "address-group": ["static", "dynamic"],
     "service": ["tcp", "udp"],
     "service-group": ["static"],
+}
+_V13_TYPES_ALT = {
+    "address": ["static", "dynamic", "interface", "group"],
 }
 
 
@@ -1120,24 +1197,34 @@ def get_device_group_objects(client: PanoramaClient, device_group: str,
         return []
     # Fall back to the modern REST proxy API (PAN-OS 12 layout differences).
     base = {"panorama": "LocalDevice", "device-group": device_group}
-    v13_errors: list[str] = []
     merged: list[dict] = []
     seen: set[str] = set()
-    types = _V13_TYPES.get(obj_type) or [None]
-    for t in types:
-        params = dict(base)
-        if t:
-            params["type"] = t
-        try:
-            page = rest_paged(client, obj_type, params)
-        except RuntimeError as exc:
-            v13_errors.append(f"type={t}: {exc}" if t else str(exc))
-            continue
-        for e in page:
-            key = str(e.get("name", id(e)))
-            if key not in seen:
-                seen.add(key)
-                merged.append(e)
+
+    def attempt(types: list) -> list[str]:
+        errs: list[str] = []
+        for t in types:
+            params = dict(base)
+            if t:
+                params["type"] = t
+            try:
+                page = rest_paged(client, obj_type, params)
+            except RuntimeError as exc:
+                errs.append(f"type={t}: {exc}" if t else str(exc))
+                continue
+            for e in page:
+                key = str(e.get("name", id(e)))
+                if key not in seen:
+                    seen.add(key)
+                    merged.append(e)
+        return errs
+
+    types = (client.v13_type_values(obj_type)
+             or _V13_TYPES.get(obj_type) or [None])
+    v13_errors = attempt(types)
+    if (not merged and v13_errors and not client.v13_spec()
+            and obj_type in _V13_TYPES_ALT
+            and all("llegal value" in e for e in v13_errors)):
+        v13_errors = attempt(_V13_TYPES_ALT[obj_type])
     if merged:
         return merged
     if v13_errors:
@@ -1146,6 +1233,10 @@ def get_device_group_objects(client: PanoramaClient, device_group: str,
               file=sys.stderr)
         for err in v13_errors[:4]:
             print(f"    {err}", file=sys.stderr)
+        if not client.v13_spec():
+            print("    hint: no OpenAPI spec served by the proxy; run "
+                  "'--diagnose' to probe it and its allowed type values",
+                  file=sys.stderr)
     return entries or []
 
 
@@ -2631,6 +2722,25 @@ def run_diagnostics(client: PanoramaClient) -> None:
             print(client.raw_get(params, path), file=sys.stderr)
         except requests.RequestException as exc:
             print(f"request failed: {exc}", file=sys.stderr)
+
+    print("\n===== REST proxy OpenAPI type enums =====", file=sys.stderr)
+    try:
+        spec = client.v13_spec()
+    except Exception as exc:
+        spec = None
+        print(f"  spec fetch failed: {exc}", file=sys.stderr)
+    if spec:
+        title = spec.get("info", {}).get("title", "?")
+        paths = list(spec.get("paths") or [])
+        print(f"  spec found: {title} ({len(paths)} paths), first 30: "
+              f"{paths[:30]}", file=sys.stderr)
+        for res in ("address", "address-group", "service",
+                    "service-group", "application", "tag"):
+            print(f"  {res} type enum: {client.v13_type_values(res)}",
+                  file=sys.stderr)
+    else:
+        print(f"  no OpenAPI spec at: {', '.join(client._V13_SPEC_PATHS)}",
+              file=sys.stderr)
 
 
 # --------------------------------------------------------------------------- #
