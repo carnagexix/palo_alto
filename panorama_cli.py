@@ -57,7 +57,7 @@ OBJECT_TYPES = [
 ]
 # Order in which object types are applied so references resolve (groups
 # reference addresses/services, objects reference tags).
-BUILD = "2026-11-18-fix17 (Mode 1: documented REST Objects listing; safe empty-scope handling)"
+BUILD = "2026-11-18-fix18 (REST Objects: accept complete bulk responses, verify pagination)"
 APPLY_ORDER = ["tag", "application", "service", "service-group", "address",
                "address-group"]
 SHARED_LABEL = "(shared)"  # pseudo group for shared objects
@@ -528,41 +528,58 @@ class PanoramaClient:
 
     def rest_list_objects(self, obj_type: str,
                           device_group: str) -> list[dict]:
-        """List objects directly owned by a scope using the documented REST API.
+        """List scope-local objects using Panorama's REST Objects endpoint.
 
-        Unlike /api/rest/v13/<type> (an incompatible proxy route),
-        /restapi/v11.0/Objects/<resource> uses location/device-group, not
-        a required object subtype query parameter. Only top-level entry
-        records are returned; nested tag/member data are not extra objects.
+        Some Panorama builds ignore limit/offset and return ALL objects in a
+        single response (even if limit=500). Use @total-count to detect a
+        complete collection before attempting another page. For endpoints
+        that do honor pagination, advance by the actual number returned.
+        Never return a truncated result when the server reports more items.
         """
         resource = REST_RESOURCES.get(obj_type)
         if resource is None:
             raise ValueError(f"REST listing not supported for {obj_type!r}")
         endpoint = f"{self.rest_base()}/{resource}"
         params = self._rest_location(device_group)
-        # Some Panorama builds require panorama=LocalDevice, others reject it.
         attempts = self._rest_location_attempts(device_group, params)
         errors: list[str] = []
         saw_empty_response = False
+        limit = 500
         for scope in attempts:
             entries: list[dict] = []
             seen: set[str] = set()
+            offset = 0
+            total_count: int | None = None
             try:
-                for page_no in range(40):
-                    limit = 500
-                    query = {**scope, "limit": limit,
-                             "offset": page_no * limit}
+                for _page in range(1000):
+                    query = {**scope, "limit": limit, "offset": offset}
                     data = self._rest("GET", endpoint, query)
                     result = data.get("result", data)
                     if not isinstance(result, dict):
                         raise RuntimeError(
                             f"unexpected REST {obj_type} result format")
+                    reported = result.get("@total-count")
+                    if reported is not None:
+                        try:
+                            count = int(reported)
+                        except (TypeError, ValueError):
+                            raise RuntimeError(
+                                f"invalid REST {obj_type} @total-count: "
+                                f"{reported!r}")
+                        if count < 0 or (total_count is not None
+                                         and count != total_count):
+                            raise RuntimeError(
+                                f"REST {obj_type} total-count changed "
+                                f"during listing; retry")
+                        total_count = count
+
                     raw = result.get("entry") or []
                     if isinstance(raw, dict):
                         raw = [raw]
                     if not isinstance(raw, list):
                         raise RuntimeError(
                             f"unexpected REST {obj_type} entry format")
+
                     new_entries = 0
                     for entry in raw:
                         if not isinstance(entry, dict):
@@ -577,15 +594,44 @@ class PanoramaClient:
                                if k != "name" and not k.startswith("@")}
                         })
                         new_entries += 1
+
                     if raw and not new_entries:
                         raise RuntimeError(
-                            f"REST {obj_type} pagination returned duplicate "
-                            f"entries at offset {page_no * limit}")
-                    if len(raw) < limit:
+                            f"REST {obj_type} did not advance at "
+                            f"offset {offset}; server may ignore pagination")
+
+                    # PAN-OS can return e.g. 29,115 entries despite limit=500.
+                    # If that equals @total-count, this is the complete list;
+                    # requesting offset=500 would duplicate everything.
+                    if total_count is not None:
+                        if len(entries) > total_count:
+                            raise RuntimeError(
+                                f"REST {obj_type} returned more unique "
+                                f"entries than @total-count={total_count}")
+                        if len(entries) == total_count:
+                            break
+                    if len(raw) > limit:
+                        raise RuntimeError(
+                            f"REST {obj_type} returned {len(raw)} entries "
+                            f"despite limit={limit}, but a complete "
+                            f"collection could not be verified")
+                    if not raw:
+                        if total_count is not None and entries:
+                            raise RuntimeError(
+                                f"REST {obj_type} stopped at "
+                                f"{len(entries)}/{total_count} entries")
                         break
+                    if len(raw) < limit and total_count is None:
+                        break
+                    offset += len(raw)
                 else:
                     raise RuntimeError(
-                        f"REST {obj_type} listing exceeded 20,000 items")
+                        f"REST {obj_type} listing exceeded 1,000 pages")
+                if (total_count is not None
+                        and len(entries) != total_count):
+                    raise RuntimeError(
+                        f"REST {obj_type} returned only {len(entries)} of "
+                        f"{total_count} reported objects")
             except RuntimeError as exc:
                 errors.append(str(exc))
                 continue

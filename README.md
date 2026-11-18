@@ -93,8 +93,18 @@ For a selected group with no XML object entries, the CLI now checks the
 documented Panorama REST resource, such as
 `/restapi/v11.0/Objects/Addresses?location=device-group&device-group=SIIG`.
 It does **not** guess the incompatible `/api/rest/v13/address?type=...`
-subtypes. An API error is displayed separately from a confirmed empty
-scope, and imports/copy/move stop safely if existing objects cannot be read.
+subtypes. On some Panorama builds, this endpoint ignores `limit` and
+`offset` and returns the **entire collection** (potentially tens of
+thousands of objects) in one request. The CLI uses the API's `@total-count`
+to detect this case, avoid duplicate page requests, and verify that the
+returned list is complete. If the API genuinely pages, it continues until
+all entries are received. An API error or incomplete result is displayed
+separately from a confirmed empty scope, and imports/copy/move stop safely
+if existing objects cannot be read.
+
+Large groups can produce lengthy terminal output. For tens of thousands
+of objects, consider **Export to CSV/JSON** instead of printing every
+object to the terminal.
 
 Both menus repeat after each action/pass, so you can browse, export, import,
 convert and run rule searches as often as you want per session before
